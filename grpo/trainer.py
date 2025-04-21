@@ -28,6 +28,11 @@ from bitsandbytes.optim import AdamW32bit, AdamW8bit
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from .loss import approx_kl_divergence, GRPOLoss
 from .replay_buffer import ReplayBuffer, Experience, join_experience_batch, zero_pad_sequences
+
+# Импортируем новые модули
+from .parallel_simulator import ParallelSimulator, parallel_rollout
+from .grpo_advantage import process_episode_batch, calculate_discounted_returns, group_advantages
+
 import argparse
 from datetime import datetime
 from simulators.single_well.simulator import SingleWellSimulator
@@ -1325,103 +1330,66 @@ def main():
 
         # --- Фаза сбора данных (Rollout) ---
         print(f"  Сбор {rollouts_per_step} эпизодов...")
-        # Вызываем rollout_simulator для сбора данных
-        batch_episode_data = rollout_simulator(
+        
+        # Создаем конфигурацию для симуляторов
+        simulator_config = {
+            'initial_reservoir_pressure': args.initial_pressure,
+            'initial_bhp': args.initial_bhp,
+            'productivity_index': args.productivity_index,
+            'total_volume': args.total_volume,
+            'dt': args.simulation_dt * args.forecast_days,
+            'max_time': args.simulation_max_time
+        }
+        
+        # Определяем тип симулятора и добавляем специфичные параметры
+        simulator_type = "multi_well" if args.multi_well else "single_well"
+        if simulator_type == "multi_well":
+            simulator_config.update({
+                'n_wells': args.n_wells,
+                'interaction_strength': args.interaction_strength,
+                'shared_reservoir': args.shared_reservoir
+            })
+        
+        # Создаем набор параллельных симуляторов
+        parallel_sim = ParallelSimulator(
+            n_simulators=rollouts_per_step,
+            simulator_type=simulator_type,
+            simulator_config=simulator_config,
+            device=device.type
+        )
+        
+        # Выполняем параллельные роллауты
+        episode_tokens, action_masks, rewards, episode_stats = parallel_rollout(
             model=model,
             tokenizer=tokenizer,
-            simulator=simulator,
-            num_episodes=rollouts_per_step,
-            logger=logger,
-            global_step=global_step,
-            max_new_tokens_per_step=max_new_tokens_per_step,
+            parallel_sim=parallel_sim,
+            n_steps=int(args.simulation_max_time / args.simulation_dt),  # Максимальное количество шагов
             temperature=temperature,
-            top_p=top_p,
+            verbose=True
         )
-
-        if not batch_episode_data:
-            print(f"  {COLOR_YELLOW}Rollout не вернул данных. Пропуск шага {global_step}.{COLOR_RESET}")
-            global_step += 1 # Увеличиваем шаг, чтобы не застрять
-            continue
-
-        # Распаковываем данные в четыре переменные (tokens, masks, rewards, stats)
-        all_episode_tokens, all_action_masks, all_rewards, all_episode_stats = batch_episode_data
-
-        print(f"  Собрано {len(all_episode_tokens)} эпизодов. Обработка и добавление в буфер...")
-        processed_episodes_count = 0
+        
+        # Обрабатываем результаты и создаем буфер опыта
+        replay_buffer = process_episode_batch(
+            model=model,
+            reference_model=reference_model,
+            tokenizer=tokenizer,
+            episodes_data=(episode_tokens, action_masks, rewards),
+            max_length=max_length,
+            gamma=args.gamma,
+            verbose=True
+        )
+        
+        print(f"  Собрано {len(replay_buffer)} эпизодов.")
+        
+        # Собираем статистику для логирования
         batch_total_production = []
         batch_total_rewards = []
-
-        # Обрабатываем данные каждого эпизода
-        for i in range(len(all_episode_tokens)):
-            # Создаем кортеж с данными эпизода
-            episode_data = (all_episode_tokens[i], all_action_masks[i], all_rewards[i])
-
-            # Распаковываем данные эпизода
-            sequences, action_mask, rewards_per_step = episode_data
-
-            # Отсекаем слишком длинные последовательности
-            if sequences.shape[0] > max_length:
-                print(f"  {COLOR_YELLOW}Пропуск эпизода: длина {sequences.shape[0]} > max_length {max_length}{COLOR_RESET}")
-                continue
-
-            # 1. Вычисляем returns (дисконтированные награды)
-            returns = calculate_discounted_returns(rewards_per_step, gamma=args.gamma)
-
-            # 2. Вычисляем advantages (нормализованные returns)
-            # advantages имеет размер [num_steps]
-            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
-
-            # 3. Распределяем advantages по токенам действия (advantages_per_token)
-            # advantages_per_token имеет размер [seq_len]
-            advantages_per_token = torch.zeros_like(sequences, dtype=torch.float32) # Инициализируем нулями
-            # Находим индексы токенов, где action_mask=True
-            action_token_indices = torch.where(action_mask)[0]
-
-            if action_token_indices.numel() > 0:
-                # Среднее значение преимущества за эпизод
-                avg_advantage = advantages.mean().item() if advantages.numel() > 0 else 0.0
-                advantages_per_token[action_mask] = avg_advantage
-
-            # 4. Вычисляем логарифмы вероятностей действий для текущей модели
-            ref_attention_mask = sequences != pad_token_id
-            action_log_probs = sequences_log_probs(
-                model=model,
-                sequence_ids=sequences.unsqueeze(0).to(device),
-                attention_mask=ref_attention_mask.unsqueeze(0).to(device)
-            ).squeeze(0).cpu() # Убираем batch_size=1, результат возвращается на CPU
-
-            # 5. Вычисляем log_probs_ref (с референсной моделью)
-            ref_model_device = next(reference_model.parameters()).device
-            log_probs_ref = sequences_log_probs(
-                model=reference_model,
-                sequence_ids=sequences.unsqueeze(0).to(ref_model_device), # Добавляем batch_size=1 и переносим
-                attention_mask=ref_attention_mask.unsqueeze(0).to(ref_model_device)
-            ).squeeze(0).cpu() # Убираем batch_size=1, результат возвращается на CPU
-
-            # 6. Собираем Experience (все тензоры на CPU)
-            exp = Experience(
-                sequences=sequences.unsqueeze(0),              # Добавляем размерность batch
-                action_log_probs=action_log_probs.unsqueeze(0),  # Добавляем размерность batch
-                log_probs_ref=log_probs_ref.unsqueeze(0),        # Добавляем размерность batch
-                returns=returns.unsqueeze(0),                    # Добавляем размерность batch
-                advantages=advantages_per_token.unsqueeze(0),    # Добавляем размерность batch
-                attention_mask=ref_attention_mask.unsqueeze(0),  # Добавляем размерность batch
-                action_mask=action_mask.unsqueeze(0),            # Добавляем размерность batch
-                kl=None                             # KL будет вычислен в лоссе
-            )
-            replay_buffer.append(exp) # Добавляем в буфер (он хранит на CPU)
-            processed_episodes_count += 1
-            # Используем последнее состояние из симулятора для логов
-            last_state_production = rewards_per_step.sum().item()  # Суммарная награда = суммарный дебит
-            batch_total_production.append(last_state_production)
-            batch_total_rewards.append(returns[0].item() if returns.numel() > 0 else 0.0) # Награда за эпизод = return в начале
-
-        # Пропускаем фазу оптимизации, если не обработали достаточно данных
-        if processed_episodes_count == 0:
-            print(f"  {COLOR_YELLOW}Не обработано ни одного эпизода. Пропуск шага {global_step}.{COLOR_RESET}")
-            global_step += 1
-            continue
-
+        
+        # Извлекаем статистику из результатов роллаутов
+        for stats in episode_stats:
+            batch_total_production.append(stats["production"])
+            batch_total_rewards.append(stats["reward"])
+            
         # --- Логируем статистику собранных данных ---
         batch_step += 1
         mean_batch_production = sum(batch_total_production) / len(batch_total_production) if batch_total_production else 0
