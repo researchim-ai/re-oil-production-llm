@@ -1,5 +1,8 @@
 # re-oil-production-llm
 
+![image](https://github.com/user-attachments/assets/6883733b-126d-4529-9cd6-850a5e500a20)
+
+
 ```
 python -m grpo.main --forecast_days 1 --simulation_max_time 7 --wandb
 ```
