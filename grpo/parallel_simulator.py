@@ -397,8 +397,28 @@ def parallel_rollout(
             
             episode_tokens_list[idx].append(action_tokens)
             
-            # Создаем маску действий
-            action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
+            # Создаем маску действий - улучшенная версия
+            # Находим числовое значение в ответе (это и есть действие)
+            numeric_pattern = re.compile(r'[0-9]*\.?[0-9]+')
+            numeric_match = numeric_pattern.search(response)
+            
+            # По умолчанию маскируем все нулями
+            action_mask = torch.zeros_like(action_tokens, dtype=torch.bool)
+            
+            if numeric_match:
+                # Если нашли число, маскируем только токены, соответствующие числу
+                numeric_text = numeric_match.group(0)
+                # Получаем токены числа
+                numeric_tokens = tokenizer.encode(numeric_text, add_special_tokens=False)
+                
+                # Маскируем токены, соответствующие числу
+                for i, token_id in enumerate(action_tokens):
+                    if token_id.item() in numeric_tokens:
+                        action_mask[i] = True
+            else:
+                # Если число не найдено, используем весь ответ (это плохо, но лучше чем ничего)
+                action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
+                
             episode_action_masks_list[idx].append(action_mask)
         
         # Выполняем шаг для активных симуляторов

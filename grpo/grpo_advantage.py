@@ -2,7 +2,9 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
+import logging
+from torch.nn.utils.rnn import pad_sequence
 
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 from .replay_buffer import Experience, ReplayBuffer, join_experience_batch
@@ -15,207 +17,261 @@ COLOR_YELLOW = "\033[93m"
 COLOR_BLUE = "\033[94m"
 COLOR_CYAN = "\033[96m"
 
-def calculate_discounted_returns(rewards, gamma=0.99):
+logger = logging.getLogger(__name__)
+
+def calculate_discounted_returns(
+    rewards: Union[List[float], torch.Tensor],
+    gamma: float,
+) -> Union[List[float], torch.Tensor]:
     """
-    Вычисляет дисконтированные возвраты для последовательности наград.
+    Вычисляет дисконтированные возвраты.
     
     Args:
-        rewards: список или тензор наград
-        gamma: коэффициент дисконтирования
+        rewards: Список или тензор наград [T]
+        gamma: Фактор дисконтирования
         
     Returns:
-        torch.Tensor: дисконтированные возвраты
+        Дисконтированные возвраты [T]
     """
-    if isinstance(rewards, list):
-        rewards = torch.tensor(rewards)
+    is_tensor = isinstance(rewards, torch.Tensor)
+    device = rewards.device if is_tensor else None
     
-    returns = torch.zeros_like(rewards, dtype=torch.float32)
+    if is_tensor:
+        rewards = rewards.cpu().tolist()
     
-    # Вычисляем возвраты от конца к началу
+    returns = []
     R = 0
-    for i in reversed(range(len(rewards))):
-        R = rewards[i] + gamma * R
-        returns[i] = R
     
+    for r in reversed(rewards):
+        R = r + gamma * R
+        returns.insert(0, R)
+    
+    if is_tensor:
+        return torch.tensor(returns, device=device)
     return returns
 
-def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    Нормализует преимущества в группе.
-    
-    Args:
-        returns: Тензор возвратов
-        eps: Малое число для численной стабильности
-        
-    Returns:
-        torch.Tensor: Нормализованные преимущества
-    """
-    return (returns - returns.mean()) / (returns.std() + eps)
-
-def sequence_log_probs_from_logits(
-    logits: torch.tensor, output_ids: torch.tensor
+def group_advantages(
+    advantages: torch.Tensor,
+    mask: torch.Tensor,
+    normalize: bool = True,
 ) -> torch.Tensor:
     """
-    Вычисляет лог-вероятности для последовательности токенов.
+    Нормализует advantages на основе маски.
     
     Args:
-        logits: Логиты выхода модели [seq_len, vocab_size]
-        output_ids: Токены-цели [seq_len]
+        advantages: Преимущества [B, T]
+        mask: Маска действий [B, T]
+        normalize: Применить нормализацию если True
         
     Returns:
-        torch.Tensor: Лог-вероятности [seq_len]
+        Нормализованные преимущества [B, T]
     """
-    output_ids = output_ids.to(logits.device) # Убедимся, что на одном устройстве
+    if not normalize:
+        return advantages
+    
+    # Преобразуем bool маску в float для арифметических операций
+    float_mask = mask.float()
+    
+    # Убедимся, что advantages тоже float
+    float_advantages = advantages.float()
+    
+    # Первичный клиппинг для устранения выбросов
+    float_advantages = torch.clamp(float_advantages, min=-10.0, max=10.0)
+    
+    # Применяем маску
+    advantages_masked = float_advantages * float_mask
+    mask_sum = float_mask.sum()
+    
+    if mask_sum > 0:
+        # Вычисляем статистики только по маскированным значениям
+        mean = advantages_masked.sum() / mask_sum
+        
+        # Вычисляем стандартное отклонение более стабильным способом
+        diff_squared = ((advantages_masked - mean) ** 2) * float_mask
+        var = diff_squared.sum() / mask_sum
+        std = torch.sqrt(var + 1e-8)  # Увеличиваем эпсилон для большей стабильности
+        
+        # Нормализуем только маскированные значения
+        normalized_advantages = float_mask * (float_advantages - mean) / std
+        
+        # Дополнительный клиппинг после нормализации, более строгий чем раньше
+        normalized_advantages = torch.clamp(normalized_advantages, min=-2.0, max=2.0)
+        
+        return normalized_advantages
+    else:
+        return float_advantages * 0.0  # Если маска пустая, возвращаем нули
+
+def get_log_probs(
+    logits: torch.Tensor,
+    sequences: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Получает log probs для указанных действий из логитов.
+    
+    Args:
+        logits: Логиты модели [B, T, V]
+        sequences: Токены последовательности [B, T]
+        mask: Маска действий [B, T]
+        
+    Returns:
+        Log probs [B, T]
+    """
+    # Проверяем размерности входных данных
+    if logits.dim() == 2:
+        logits = logits.unsqueeze(0)  # [T, V] -> [1, T, V]
+    
+    if sequences.dim() == 1:
+        sequences = sequences.unsqueeze(0)  # [T] -> [1, T]
+    
+    # Вычисляем log probs из логитов
     log_probs = F.log_softmax(logits, dim=-1)
-    action_log_probs = torch.gather(log_probs, -1, output_ids.unsqueeze(-1)).squeeze(-1)
-    return action_log_probs
-
-def sequences_log_probs(
-    model: AutoModelForCausalLM,
-    sequence_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Получает лог-вероятности для всех токенов в батче последовательностей.
     
-    Args:
-        model: Языковая модель
-        sequence_ids: Тензор последовательностей [batch_size, seq_len]
-        attention_mask: Маска внимания [batch_size, seq_len]
-        
-    Returns:
-        torch.Tensor: Лог-вероятности [batch_size, seq_len]
-    """
-    # Переносим на устройство модели, если не там
-    model_device = next(model.parameters()).device
-    sequence_ids = sequence_ids.to(model_device)
-    attention_mask = attention_mask.to(model_device)
-
-    # Убедимся, что модель в режиме eval для вычисления логитов
-    is_training = model.training
-    model.eval()
-
-    with torch.no_grad(): # Не считаем градиенты здесь
-        # Получаем логиты от модели для всей последовательности
-        # output.logits shape: [batch_size, seq_len, vocab_size]
-        output = model(input_ids=sequence_ids, attention_mask=attention_mask, use_cache=False)
-        logits = output.logits
-
-    # Возвращаем модель в исходный режим
-    if is_training:
-        model.train()
-
-    # Сдвигаем логиты и sequence_ids для вычисления лог-вероятностей P(token_i | token_0...token_{i-1})
-    # logits shape: [batch_size, seq_len, vocab_size] -> [batch_size, seq_len-1, vocab_size]
-    # sequence_ids shape: [batch_size, seq_len] -> [batch_size, seq_len-1]
-    shifted_logits = logits[:, :-1, :]
-    shifted_sequence_ids = sequence_ids[:, 1:]
-
-    # Вычисляем лог-вероятности для каждого токена (кроме первого)
-    # log_probs shape: [batch_size, seq_len-1]
-    log_probs = sequence_log_probs_from_logits(shifted_logits, shifted_sequence_ids)
-
-    # Добавляем 0 в начало для первого токена (его вероятность не определена таким образом)
-    # и переносим на CPU, чтобы соответствовать другим данным в Experience
-    zero_log_probs = torch.zeros(log_probs.size(0), 1, device=log_probs.device)
-    full_log_probs = torch.cat([zero_log_probs, log_probs], dim=1)
-
-    return full_log_probs.to('cpu') # Возвращаем на CPU
+    # Берем log probs для токенов в sequences
+    log_probs = torch.gather(log_probs, 2, sequences.unsqueeze(-1)).squeeze(-1)
+    
+    if mask is not None:
+        log_probs = log_probs * mask
+    
+    return log_probs
 
 def process_episode_batch(
-    model: AutoModelForCausalLM,
-    reference_model: AutoModelForCausalLM,
-    tokenizer: PreTrainedTokenizer,
-    episodes_data: Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]],
-    max_length: int = 1024,
+    model_batch_data: Dict[str, torch.Tensor],
+    ref_batch_data: Dict[str, torch.Tensor],
+    actions_batch: List[Dict],
+    device: torch.device,
     gamma: float = 0.99,
-    verbose: bool = True,
-) -> ReplayBuffer:
+    window_size: int = 2048,
+    total_steps: int = 10,
+    normalize_advantages: bool = True,
+) -> Experience:
     """
-    Обрабатывает результаты роллаутов и создает буфер опыта для GRPO.
+    Обрабатывает batch эпизодов и создает Experience для ReplayBuffer.
     
     Args:
-        model: Основная языковая модель
-        reference_model: Референсная языковая модель
-        tokenizer: Токенизатор
-        episodes_data: Кортеж (all_episode_tokens, all_action_masks, all_rewards)
-        max_length: Максимальная длина последовательности
-        gamma: Коэффициент дисконтирования
-        verbose: Выводить ли подробную информацию
-        
+        model_batch_data: Данные от основной модели
+        ref_batch_data: Данные от референсной модели
+        actions_batch: Список действий и наград
+        device: Устройство для размещения тензоров
+        gamma: Фактор дисконтирования
+        window_size: Максимальный размер окна для токенизации
+        total_steps: Общее число шагов в эпизоде
+        normalize_advantages: Нормализовать ли advantages
+    
     Returns:
-        ReplayBuffer: Буфер опыта для GRPO
+        Experience для добавления в ReplayBuffer
     """
-    all_episode_tokens, all_action_masks, all_rewards = episodes_data
-    replay_buffer = ReplayBuffer()
+    batch_size = len(actions_batch)
     
-    # Обрабатываем данные каждого эпизода
-    processed_count = 0
+    # Получаем данные от моделей
+    model_logits = model_batch_data["logits"]
+    model_action_mask = model_batch_data["action_masks"]
+    model_sequences = model_batch_data["sequences"]
+    ref_logits = ref_batch_data["logits"]
     
-    for i in range(len(all_episode_tokens)):
-        # Распаковываем данные эпизода
-        sequences = all_episode_tokens[i]
-        action_mask = all_action_masks[i]
-        rewards_per_step = all_rewards[i]
+    # Подготовка списков для хранения данных по каждому эпизоду
+    batch_advantages = []
+    batch_old_log_probs = []
+    batch_ref_log_probs = []
+    batch_returns = []
+    
+    # Обрабатываем каждый эпизод в батче
+    for episode_idx in range(batch_size):
+        episode_data = actions_batch[episode_idx]
         
-        # Проверяем длину последовательности
-        if sequences.shape[0] > max_length:
-            if verbose:
-                print(f"{COLOR_YELLOW}Пропуск эпизода {i+1}: длина {sequences.shape[0]} > max_length {max_length}{COLOR_RESET}")
-            continue
+        # Извлекаем награды для текущего эпизода
+        episode_rewards = [action["reward"] for action in episode_data["actions"]]
         
-        # 1. Вычисляем returns (дисконтированные награды)
-        returns = calculate_discounted_returns(rewards_per_step, gamma=gamma)
+        # Клиппинг наград для стабильности
+        episode_rewards = [min(max(r, -10.0), 10.0) for r in episode_rewards]
         
-        # 2. Вычисляем advantages (нормализованные returns)
-        advantages = group_advantages(returns)
-        
-        # 3. Распределяем advantages по токенам действия (advantages_per_token)
-        advantages_per_token = torch.zeros_like(sequences, dtype=torch.float32)
-        action_token_indices = torch.where(action_mask)[0]
-        
-        if action_token_indices.numel() > 0:
-            # Среднее значение преимущества за эпизод
-            avg_advantage = advantages.mean().item() if advantages.numel() > 0 else 0.0
-            advantages_per_token[action_mask] = avg_advantage
-        
-        # 4. Вычисляем логарифмы вероятностей действий для текущей модели
-        pad_token_id = tokenizer.pad_token_id
-        ref_attention_mask = sequences != pad_token_id
-        
-        action_log_probs = sequences_log_probs(
-            model=model,
-            sequence_ids=sequences.unsqueeze(0).to(next(model.parameters()).device),
-            attention_mask=ref_attention_mask.unsqueeze(0).to(next(model.parameters()).device)
-        ).squeeze(0).cpu()
-        
-        # 5. Вычисляем log_probs_ref (с референсной моделью)
-        ref_model_device = next(reference_model.parameters()).device
-        log_probs_ref = sequences_log_probs(
-            model=reference_model,
-            sequence_ids=sequences.unsqueeze(0).to(ref_model_device),
-            attention_mask=ref_attention_mask.unsqueeze(0).to(ref_model_device)
-        ).squeeze(0).cpu()
-        
-        # 6. Собираем Experience
-        exp = Experience(
-            sequences=sequences.unsqueeze(0),
-            action_log_probs=action_log_probs.unsqueeze(0),
-            log_probs_ref=log_probs_ref.unsqueeze(0),
-            returns=returns.unsqueeze(0),
-            advantages=advantages_per_token.unsqueeze(0),
-            attention_mask=ref_attention_mask.unsqueeze(0),
-            action_mask=action_mask.unsqueeze(0),
-            kl=None  # KL будет вычислен в лоссе
+        # Вычисляем дисконтированные возвраты
+        episode_returns = calculate_discounted_returns(
+            torch.tensor(episode_rewards, device=device), 
+            gamma
         )
         
-        replay_buffer.append(exp)
-        processed_count += 1
+        # Клиппинг возвратов
+        episode_returns = torch.clamp(episode_returns, min=-10.0, max=10.0)
         
-        if verbose and processed_count % 10 == 0:
-            print(f"{COLOR_BLUE}Обработано {processed_count} эпизодов{COLOR_RESET}")
+        # Получаем маску действий и последовательность токенов для эпизода
+        action_mask = model_action_mask[episode_idx]
+        sequence = model_sequences[episode_idx]
+        
+        # Инициализируем массив advantages нулями
+        episode_advantages = torch.zeros_like(action_mask, device=device)
+        
+        # Распределяем advantages по токенам для каждого шага
+        token_idx = 0
+        for step_idx, action in enumerate(episode_data["actions"]):
+            tokens_count = len(action["token_ids"])
+            
+            # Если есть токены для текущего действия
+            if tokens_count > 0:
+                # Назначаем соответствующее advantage всем токенам текущего действия
+                advantage_value = episode_returns[step_idx]
+                
+                # Применяем advantage к токенам этого действия
+                for token_id in action["token_ids"]:
+                    if token_id < len(episode_advantages):
+                        episode_advantages[token_id] = advantage_value
+                    else:
+                        # В случае проблем с индексами (вряд ли должно случиться)
+                        print(f"WARNING: token_id {token_id} out of bounds for episode_advantages with shape {episode_advantages.shape}")
+        
+        # Получаем log probabilities для действий в эпизоде
+        # Маскируем логиты до вычисления log probs
+        episode_log_probs = get_log_probs(
+            model_logits[episode_idx], 
+            sequence,
+            mask=action_mask,
+        )
+        
+        # Получаем log probs от референсной модели
+        episode_ref_log_probs = get_log_probs(
+            ref_logits[episode_idx], 
+            sequence,
+            mask=action_mask,
+        )
+        
+        # Клиппинг log probs для стабильности
+        episode_log_probs = torch.clamp(episode_log_probs, min=-20.0, max=0.0)
+        episode_ref_log_probs = torch.clamp(episode_ref_log_probs, min=-20.0, max=0.0)
+        
+        # Сохраняем данные для эпизода
+        batch_advantages.append(episode_advantages)
+        batch_old_log_probs.append(episode_log_probs)
+        batch_ref_log_probs.append(episode_ref_log_probs)
+        # Для returns создаем тензор той же формы что и advantages, 
+        # но с единым значением для всего эпизода (сумма наград)
+        batch_returns.append(torch.ones_like(episode_advantages) * episode_rewards[-1])
     
-    if verbose:
-        print(f"{COLOR_GREEN}Обработано всего {processed_count} эпизодов{COLOR_RESET}")
+    # Паддинг (дополнение) и объединение данных из разных эпизодов
+    # Используем torch.nn.utils.rnn.pad_sequence для паддинга
+    padded_sequences = pad_sequence(model_batch_data["sequences"], batch_first=True)
+    padded_action_masks = pad_sequence(model_batch_data["action_masks"], batch_first=True)
+    padded_advantages = pad_sequence(batch_advantages, batch_first=True)
+    padded_old_log_probs = pad_sequence(batch_old_log_probs, batch_first=True)
+    padded_ref_log_probs = pad_sequence(batch_ref_log_probs, batch_first=True)
+    padded_returns = pad_sequence(batch_returns, batch_first=True)
     
-    return replay_buffer 
+    # Создаем маску внимания для паддинга
+    attention_mask = (padded_sequences != 0).float()
+    
+    # Нормализуем advantages, если нужно
+    if normalize_advantages:
+        padded_advantages = group_advantages(padded_advantages, padded_action_masks)
+    
+    # Создаем Experience
+    experience = Experience(
+        sequences=padded_sequences,
+        action_log_probs=padded_old_log_probs,
+        log_probs_ref=padded_ref_log_probs,
+        returns=padded_returns,
+        advantages=padded_advantages,
+        attention_mask=attention_mask,
+        action_mask=padded_action_masks,
+        kl=None,  # Не вычисляем KL здесь, это будет сделано в objective
+    )
+    
+    return experience 

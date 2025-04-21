@@ -179,7 +179,7 @@ class MultiWellSimulator:
             self.state[i * self.state_dim_per_well + 3] = self.time
 
         # 6. Считаем общую награду как сумму дебитов всех скважин
-        reward = sum(current_rates)/
+        reward = sum(current_rates)
 
         # 7. Проверяем условие завершения
         # Симуляция завершается, если:
