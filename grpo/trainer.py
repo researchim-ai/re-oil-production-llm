@@ -28,6 +28,11 @@ from bitsandbytes.optim import AdamW32bit, AdamW8bit
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from .loss import approx_kl_divergence, GRPOLoss
 from .replay_buffer import ReplayBuffer, Experience, join_experience_batch, zero_pad_sequences
+
+# Импортируем новые модули
+from .parallel_simulator import ParallelSimulator, parallel_rollout
+from .grpo_advantage import process_episode_batch, calculate_discounted_returns, group_advantages
+
 import argparse
 from datetime import datetime
 from simulators.single_well.simulator import SingleWellSimulator
@@ -649,41 +654,42 @@ def sequences_log_probs(
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Получает лог-вероятности для всех токенов в батче последовательностей."""
-    # Переносим на устройство модели, если не там
-    model_device = next(model.parameters()).device
-    sequence_ids = sequence_ids.to(model_device)
-    attention_mask = attention_mask.to(model_device)
-
-    # Убедимся, что модель в режиме eval для вычисления логитов
-    is_training = model.training
-    model.eval()
-
-    with torch.no_grad(): # Не считаем градиенты здесь
-        # Получаем логиты от модели для всей последовательности
-        # output.logits shape: [batch_size, seq_len, vocab_size]
-        output = model(input_ids=sequence_ids, attention_mask=attention_mask, use_cache=False)
-        logits = output.logits
-
-    # Возвращаем модель в исходный режим
-    if is_training:
-        model.train()
-
-    # Сдвигаем логиты и sequence_ids для вычисления лог-вероятностей P(token_i | token_0...token_{i-1})
-    # logits shape: [batch_size, seq_len, vocab_size] -> [batch_size, seq_len-1, vocab_size]
-    # sequence_ids shape: [batch_size, seq_len] -> [batch_size, seq_len-1]
+    # Создаем position_ids для корректной работы attention
+    position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    position_ids.masked_fill_(mask=(attention_mask == 0), value=0)
+    
+    # Пропускаем через модель
+    with torch.no_grad():
+        output = model.forward(
+            input_ids=sequence_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
+    
+    # Получаем логиты и смещаем их на один шаг вперед
+    # чтобы предсказывать следующий токен
+    logits = output.logits
+    
+    # Обрезаем последний токен и добавляем игнорируемый первый токен для выравнивания размеров
     shifted_logits = logits[:, :-1, :]
-    shifted_sequence_ids = sequence_ids[:, 1:]
-
-    # Вычисляем лог-вероятности для каждого токена (кроме первого)
-    # log_probs shape: [batch_size, seq_len-1]
-    log_probs = sequence_log_probs_from_logits(shifted_logits, shifted_sequence_ids)
-
-    # Добавляем 0 в начало для первого токена (его вероятность не определена таким образом)
-    # и переносим на CPU, чтобы соответствовать другим данным в Experience
-    zero_log_probs = torch.zeros(log_probs.size(0), 1, device=log_probs.device)
-    full_log_probs = torch.cat([zero_log_probs, log_probs], dim=1)
-
-    return full_log_probs.to('cpu') # Возвращаем на CPU
+    shifted_ids = sequence_ids[:, 1:]
+    
+    # Рассчитываем логарифм вероятности для сдвинутых токенов
+    log_probs = sequence_log_probs_from_logits(
+        shifted_logits, shifted_ids
+    )
+    
+    # Добавляем нулевую вероятность для первого токена
+    # чтобы сохранить размерность
+    batch_size = sequence_ids.shape[0]
+    zeros = torch.zeros(batch_size, 1, device=sequence_ids.device)
+    log_probs = torch.cat([zeros, log_probs], dim=1)
+    
+    # Клиппинг для стабильности
+    log_probs = torch.clamp(log_probs, min=-20.0, max=0.0)
+    
+    return log_probs
 
 
 def parse_args():
@@ -714,7 +720,7 @@ def parse_args():
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Gradient clipping norm')
 
     # Аргументы GRPO/PPO
-    parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor for returns')
+    parser.add_argument('--gamma', type=float, default=0.97, help='Discount factor for returns')
     parser.add_argument('--kl_weight', type=float, default=0.02, help='Weight for KL penalty in GRPOLoss')
     parser.add_argument('--clip_eps', type=float, default=0.2, help='Clipping epsilon for PPO ratio in GRPOLoss')
 
@@ -1325,103 +1331,159 @@ def main():
 
         # --- Фаза сбора данных (Rollout) ---
         print(f"  Сбор {rollouts_per_step} эпизодов...")
-        # Вызываем rollout_simulator для сбора данных
-        batch_episode_data = rollout_simulator(
+        
+        # Создаем конфигурацию для симуляторов
+        simulator_config = {
+            'initial_reservoir_pressure': args.initial_pressure,
+            'initial_bhp': args.initial_bhp,
+            'productivity_index': args.productivity_index,
+            'total_volume': args.total_volume,
+            'dt': args.simulation_dt * args.forecast_days,
+            'max_time': args.simulation_max_time
+        }
+        
+        # Определяем тип симулятора и добавляем специфичные параметры
+        simulator_type = "multi_well" if args.multi_well else "single_well"
+        if simulator_type == "multi_well":
+            simulator_config.update({
+                'n_wells': args.n_wells,
+                'interaction_strength': args.interaction_strength,
+                'shared_reservoir': args.shared_reservoir
+            })
+        
+        # Создаем набор параллельных симуляторов
+        parallel_sim = ParallelSimulator(
+            n_simulators=rollouts_per_step,
+            simulator_type=simulator_type,
+            simulator_config=simulator_config,
+            device=device.type
+        )
+        
+        # Выполняем параллельные роллауты
+        episode_tokens, action_masks, rewards, episode_stats = parallel_rollout(
             model=model,
             tokenizer=tokenizer,
-            simulator=simulator,
-            num_episodes=rollouts_per_step,
-            logger=logger,
-            global_step=global_step,
-            max_new_tokens_per_step=max_new_tokens_per_step,
+            parallel_sim=parallel_sim,
+            n_steps=int(args.simulation_max_time / args.simulation_dt),  # Максимальное количество шагов
             temperature=temperature,
-            top_p=top_p,
+            verbose=True
         )
-
-        if not batch_episode_data:
-            print(f"  {COLOR_YELLOW}Rollout не вернул данных. Пропуск шага {global_step}.{COLOR_RESET}")
-            global_step += 1 # Увеличиваем шаг, чтобы не застрять
-            continue
-
-        # Распаковываем данные в четыре переменные (tokens, masks, rewards, stats)
-        all_episode_tokens, all_action_masks, all_rewards, all_episode_stats = batch_episode_data
-
-        print(f"  Собрано {len(all_episode_tokens)} эпизодов. Обработка и добавление в буфер...")
-        processed_episodes_count = 0
+        
+        # Обрабатываем результаты и создаем буфер опыта
+        # Подготавливаем данные в нужном формате для process_episode_batch
+        device = next(model.parameters()).device
+        
+        # Генерируем логиты для обоих моделей и формируем входные данные
+        model_batch_data = {}
+        ref_batch_data = {}
+        actions_batch = []
+        
+        with torch.no_grad():
+            # Обрабатываем каждый эпизод
+            for ep_idx, (tokens, masks, ep_rewards) in enumerate(zip(episode_tokens, action_masks, rewards)):
+                # Создаем внимание для последовательности
+                attention_mask = torch.ones_like(tokens, dtype=torch.bool)
+                
+                # Получаем логиты от основной модели
+                model_outputs = model(tokens.unsqueeze(0), attention_mask=attention_mask.unsqueeze(0))
+                model_logits = model_outputs.logits.squeeze(0)
+                
+                # Получаем логиты от референсной модели
+                ref_outputs = reference_model(tokens.unsqueeze(0), attention_mask=attention_mask.unsqueeze(0))
+                ref_logits = ref_outputs.logits.squeeze(0)
+                
+                # Сохраняем данные для текущего эпизода
+                if ep_idx == 0:
+                    model_batch_data["logits"] = [model_logits]
+                    model_batch_data["action_masks"] = [masks]
+                    model_batch_data["sequences"] = [tokens]
+                    ref_batch_data["logits"] = [ref_logits]
+                else:
+                    model_batch_data["logits"].append(model_logits)
+                    model_batch_data["action_masks"].append(masks)
+                    model_batch_data["sequences"].append(tokens)
+                    ref_batch_data["logits"].append(ref_logits)
+                
+                # Формируем информацию о действиях и наградах
+                actions_data = {"actions": []}
+                
+                # В parallel_rollout.py episode_tokens и episode_action_masks формируются по шагам
+                # и объединяются с помощью torch.cat. Нам нужно разделить это обратно.
+                
+                # Получаем статистику по эпизоду (если доступна)
+                ep_stats = episode_stats[ep_idx] if ep_idx < len(episode_stats) else None
+                num_steps = len(ep_rewards)
+                
+                if ep_stats and "actions" in ep_stats:
+                    # Используем информацию о действиях из статистики эпизода
+                    for step_idx, (reward, action) in enumerate(zip(ep_rewards, ep_stats["actions"])):
+                        # Создаем примерные token_ids для действия (упрощенно)
+                        # Мы не знаем точно, какие токены соответствуют какому шагу
+                        # Это приближение, в идеале нужно более точное отслеживание токенов
+                        token_indices = [i for i, mask_val in enumerate(masks) if mask_val]
+                        step_token_indices = token_indices[:len(token_indices) // num_steps]
+                        
+                        step_action = {
+                            "reward": reward.item(),
+                            "token_ids": step_token_indices,
+                            "action_value": action,  # Добавляем фактическое значение действия
+                        }
+                        actions_data["actions"].append(step_action)
+                else:
+                    # Если статистики нет, равномерно распределяем маски
+                    # по количеству шагов (это упрощение, не идеальное решение)
+                    token_indices = torch.where(masks)[0].tolist()
+                    tokens_per_step = max(1, len(token_indices) // num_steps)
+                    
+                    for step_idx, reward in enumerate(ep_rewards):
+                        start_idx = step_idx * tokens_per_step
+                        end_idx = min((step_idx + 1) * tokens_per_step, len(token_indices))
+                        
+                        step_token_indices = token_indices[start_idx:end_idx]
+                        if not step_token_indices and token_indices:  # Если пусто, но есть токены
+                            step_token_indices = [token_indices[0]]  # Используем первый токен
+                            
+                        step_action = {
+                            "reward": reward.item(),
+                            "token_ids": step_token_indices,
+                        }
+                        actions_data["actions"].append(step_action)
+                
+                actions_batch.append(actions_data)
+        
+        # Преобразуем списки в тензоры
+        model_batch_data["logits"] = torch.stack(model_batch_data["logits"])
+        model_batch_data["sequences"] = torch.stack(model_batch_data["sequences"])
+        model_batch_data["action_masks"] = torch.stack(model_batch_data["action_masks"])
+        ref_batch_data["logits"] = torch.stack(ref_batch_data["logits"])
+        
+        # Теперь вызываем функцию с правильными аргументами
+        experiences = process_episode_batch(
+            model_batch_data=model_batch_data,
+            ref_batch_data=ref_batch_data,
+            actions_batch=actions_batch,
+            device=device,
+            gamma=args.gamma,
+            window_size=max_length,
+            total_steps=len(rewards[0]) if rewards else 0,
+            normalize_advantages=True
+        )
+        
+        # Создаем буфер воспроизведения и добавляем опыт
+        replay_buffer = ReplayBuffer()
+        replay_buffer.append(experiences)
+        
+        print(f"  Собрано {len(replay_buffer)} эпизодов.")
+        
+        # Собираем статистику для логирования
         batch_total_production = []
         batch_total_rewards = []
-
-        # Обрабатываем данные каждого эпизода
-        for i in range(len(all_episode_tokens)):
-            # Создаем кортеж с данными эпизода
-            episode_data = (all_episode_tokens[i], all_action_masks[i], all_rewards[i])
-
-            # Распаковываем данные эпизода
-            sequences, action_mask, rewards_per_step = episode_data
-
-            # Отсекаем слишком длинные последовательности
-            if sequences.shape[0] > max_length:
-                print(f"  {COLOR_YELLOW}Пропуск эпизода: длина {sequences.shape[0]} > max_length {max_length}{COLOR_RESET}")
-                continue
-
-            # 1. Вычисляем returns (дисконтированные награды)
-            returns = calculate_discounted_returns(rewards_per_step, gamma=args.gamma)
-
-            # 2. Вычисляем advantages (нормализованные returns)
-            # advantages имеет размер [num_steps]
-            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
-
-            # 3. Распределяем advantages по токенам действия (advantages_per_token)
-            # advantages_per_token имеет размер [seq_len]
-            advantages_per_token = torch.zeros_like(sequences, dtype=torch.float32) # Инициализируем нулями
-            # Находим индексы токенов, где action_mask=True
-            action_token_indices = torch.where(action_mask)[0]
-
-            if action_token_indices.numel() > 0:
-                # Среднее значение преимущества за эпизод
-                avg_advantage = advantages.mean().item() if advantages.numel() > 0 else 0.0
-                advantages_per_token[action_mask] = avg_advantage
-
-            # 4. Вычисляем логарифмы вероятностей действий для текущей модели
-            ref_attention_mask = sequences != pad_token_id
-            action_log_probs = sequences_log_probs(
-                model=model,
-                sequence_ids=sequences.unsqueeze(0).to(device),
-                attention_mask=ref_attention_mask.unsqueeze(0).to(device)
-            ).squeeze(0).cpu() # Убираем batch_size=1, результат возвращается на CPU
-
-            # 5. Вычисляем log_probs_ref (с референсной моделью)
-            ref_model_device = next(reference_model.parameters()).device
-            log_probs_ref = sequences_log_probs(
-                model=reference_model,
-                sequence_ids=sequences.unsqueeze(0).to(ref_model_device), # Добавляем batch_size=1 и переносим
-                attention_mask=ref_attention_mask.unsqueeze(0).to(ref_model_device)
-            ).squeeze(0).cpu() # Убираем batch_size=1, результат возвращается на CPU
-
-            # 6. Собираем Experience (все тензоры на CPU)
-            exp = Experience(
-                sequences=sequences.unsqueeze(0),              # Добавляем размерность batch
-                action_log_probs=action_log_probs.unsqueeze(0),  # Добавляем размерность batch
-                log_probs_ref=log_probs_ref.unsqueeze(0),        # Добавляем размерность batch
-                returns=returns.unsqueeze(0),                    # Добавляем размерность batch
-                advantages=advantages_per_token.unsqueeze(0),    # Добавляем размерность batch
-                attention_mask=ref_attention_mask.unsqueeze(0),  # Добавляем размерность batch
-                action_mask=action_mask.unsqueeze(0),            # Добавляем размерность batch
-                kl=None                             # KL будет вычислен в лоссе
-            )
-            replay_buffer.append(exp) # Добавляем в буфер (он хранит на CPU)
-            processed_episodes_count += 1
-            # Используем последнее состояние из симулятора для логов
-            last_state_production = rewards_per_step.sum().item()  # Суммарная награда = суммарный дебит
-            batch_total_production.append(last_state_production)
-            batch_total_rewards.append(returns[0].item() if returns.numel() > 0 else 0.0) # Награда за эпизод = return в начале
-
-        # Пропускаем фазу оптимизации, если не обработали достаточно данных
-        if processed_episodes_count == 0:
-            print(f"  {COLOR_YELLOW}Не обработано ни одного эпизода. Пропуск шага {global_step}.{COLOR_RESET}")
-            global_step += 1
-            continue
-
+        
+        # Извлекаем статистику из результатов роллаутов
+        for stats in episode_stats:
+            batch_total_production.append(stats["production"])
+            batch_total_rewards.append(stats["reward"])
+            
         # --- Логируем статистику собранных данных ---
         batch_step += 1
         mean_batch_production = sum(batch_total_production) / len(batch_total_production) if batch_total_production else 0
@@ -1491,17 +1553,17 @@ def main():
                 loss_dict = objective(
                     logits=outputs.logits,
                     sequences=batch_device["sequences"],
-                    old_logprobs=batch_device["action_log_probs"],
-                    ref_logprobs=batch_device["log_probs_ref"],
                     advantages=batch_device["advantages"],
-                    mask=batch_device["action_mask"]
+                    action_mask=batch_device["action_mask"],
+                    old_logprobs=batch_device["action_log_probs"],
+                    ref_logprobs=batch_device["log_probs_ref"]
                 )
                 
                 # Распаковываем составляющие лосса
                 loss = loss_dict["loss"]
                 policy_loss = loss_dict["policy_loss"]
-                kl_loss = loss_dict["kl_loss"]
-                entropy = loss_dict["entropy"]
+                kl_loss = loss_dict.get("kl", torch.tensor(0.0, device=device))
+                entropy = loss_dict.get("entropy", torch.tensor(0.0, device=device))
                 
                 # Обратное распространение и оптимизация
                 loss.backward()
