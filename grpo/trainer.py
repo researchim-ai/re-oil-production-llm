@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 # так можно выбирать устройство для запуска LLM
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from collections.abc import Callable
 import json
