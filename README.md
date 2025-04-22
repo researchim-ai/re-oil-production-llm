@@ -30,7 +30,7 @@ The trained models learn to control the choke opening (from 0 to 1) to maximize 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/re-oil-production-llm.git
+git clone https://github.com/researchim-ai/re-oil-production-llm.git
 cd re-oil-production-llm
 ```
 
