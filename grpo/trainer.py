@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 # так можно выбирать устройство для запуска LLM
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from collections.abc import Callable
 import json
@@ -37,6 +37,11 @@ import argparse
 from datetime import datetime
 from simulators.single_well.simulator import SingleWellSimulator
 import time
+import pickle
+from tqdm import tqdm
+
+from simulators.multi_well.simulator import MultiWellSimulator
+from grpo.prompts import get_single_well_prompt, get_subsequent_step_prompt, get_first_step_prompt, BASE_PROMPT_TEMPLATE
 
 # --- Добавляем константы для цветов ---
 COLOR_RESET = "\033[0m"
@@ -769,280 +774,237 @@ def parse_args():
 ###############################################################################
 
 def rollout_simulator(
-    model,
-    tokenizer,
-    simulator,
-    num_episodes: int,
-    logger: Logger = None,
-    global_step: int = 0,
-    max_new_tokens_per_step: int = 5,
-    temperature: float = 0.1,
+    model: AutoModelForCausalLM,
+    tokenizer: PreTrainedTokenizer,
+    simulator: Union[SingleWellSimulator, MultiWellSimulator],
+    max_steps: int = 10,
+    temperature: float = 0.7,
     top_p: float = 0.95,
-):
+    do_sample: bool = True,
+    seed: Optional[int] = None,
+    verbose: bool = False,
+) -> Tuple[
+    torch.Tensor,  # episode_tokens,
+    torch.Tensor,  # action_masks
+    torch.Tensor,  # rewards
+    Dict,          # episode_metrics
+]:
     """
-    Выполняет несколько эпизодов взаимодействия языковой модели с симулятором скважины.
+    Выполняет симуляцию одного эпизода с одной скважиной.
     
     Args:
         model: Языковая модель
         tokenizer: Токенизатор
-        simulator: Объект симулятора
-        num_episodes: Количество эпизодов для выполнения
-        logger: Объект логгера (опционально)
-        global_step: Глобальный шаг для логирования
-        max_new_tokens_per_step: Максимальное количество новых токенов, генерируемых моделью за шаг
+        simulator: Объект симулятора (SingleWellSimulator или MultiWellSimulator)
+        max_steps: Максимальное количество шагов
         temperature: Температура генерации
-        top_p: Параметр top-p сэмплирования
+        top_p: Параметр top_p для генерации
+        do_sample: Выполнять ли семплирование при генерации
+        seed: Случайное зерно для воспроизводимости
+        verbose: Выводить ли информацию в процессе выполнения
         
     Returns:
-        tuple: Кортеж с токенами, масками действий и наградами для всех эпизодов
+        Кортеж из:
+            episode_tokens: Тензор токенов взаимодействия
+            action_masks: Маски для токенов действий
+            rewards: Тензор наград
+            episode_metrics: Словарь метрик эпизода
     """
-    COLOR_RED = "\033[31m"
-    COLOR_GREEN = "\033[32m"
-    COLOR_YELLOW = "\033[33m"
-    COLOR_BLUE = "\033[34m"
-    COLOR_MAGENTA = "\033[35m"
-    COLOR_CYAN = "\033[36m"
-    COLOR_RESET = "\033[0m"
-    
-    # Создаем конфигурацию генерации
-    gen_config = GenerationConfig(
-        max_new_tokens=max_new_tokens_per_step,
-        do_sample=True,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    
-    # Контейнеры для сбора данных по всем эпизодам
-    all_episode_tokens = []
-    all_action_masks = []
-    all_rewards = []
-    all_episode_stats = []
-    
-    for episode in range(num_episodes):
-        print(f"{COLOR_CYAN}Запуск эпизода {episode+1}/{num_episodes}{COLOR_RESET}")
-        
-        # Сбрасываем состояние симулятора
-        state = simulator.reset()
-        
-        # Инициализируем переменные для отслеживания эпизода
-        done = False
-        episode_reward = 0.0
-        episode_steps = 0
-        max_steps = 100  # Максимальное количество шагов для предотвращения бесконечных эпизодов
-        episode_production = 0.0
-        start_time = time.time()
-        
-        # Данные эпизода
-        episode_tokens = []
-        episode_action_masks = []
-        episode_rewards = []
-        episode_actions = []
-        
-        # История взаимодействий для включения в промпт
-        history = []
-        
-        try:
-            while not done and episode_steps < max_steps:
-                # Форматируем состояние для вывода
-                state_text = format_state(state, simulator)
-                
-                # Формируем промпт для модели с учетом типа симулятора
-                if hasattr(simulator, 'well_names') and len(simulator.well_names) > 1:
-                    system_prompt = """ЗАДАЧА: Управление добычей нефти в нескольких скважинах.
-ТРЕБУЕТСЯ: Указать степень открытия штуцера от 0 до 1.
-ФОРМАТ ОТВЕТА: Только число от 0 до 1, без текста."""
-                else:
-                    system_prompt = """ЗАДАЧА: Управление добычей нефти в одной скважине.
-ТРЕБУЕТСЯ: Указать степень открытия штуцера от 0 до 1.
-ФОРМАТ ОТВЕТА: Только число от 0 до 1, без текста."""
-                
-                # Ограничиваем историю до 2 последних взаимодействий для экономии токенов
-                if len(history) > 2:
-                    history = history[-2:]
-                
-                if episode_steps == 0:
-                    # Первый шаг эпизода - более директивный промпт
-                    prompt = f"""{system_prompt}
+    model.eval()
+    device = next(model.parameters()).device
 
-Состояние: {state_text}
+    # Инициализируем метрики эпизода
+    episode_tokens = []
+    episode_actions = []
+    episode_rewards = []
+    episode_format_rewards = []
+    
+    # Инициализируем буфер для всего диалога (вход-ответ-вход-ответ...)
+    simulator.reset(seed=seed)
+    state = simulator.get_state()
+    
+    # Проверяем, имеем ли мы дело с многоскважинным симулятором
+    is_multi_well = hasattr(simulator, 'well_names') and len(getattr(simulator, 'well_names', [])) > 1
+    
+    # Сохраняем историю диалога
+    history = []
+    
+    episode_production = 0.0
+    total_reward = 0.0
+    
+    # Для одного роллаута не используем заготовленный шаблон PROMPT_TEMPLATE, 
+    # а используем функции из модуля prompts.py
+    
+    if verbose:
+        print("Начинаем новый эпизод")
+    
+    # Выполняем шаги симуляции
+    for step in range(max_steps):
+        # Форматируем состояние
+        state_text = format_state(state, simulator)
+        
+        # Получаем промпт на основе текущего состояния и истории
+        if not history:
+            # Первый шаг эпизода
+            prompt = get_first_step_prompt(state_text, is_multi_well)
+        else:
+            # Последующие шаги с историей
+            history_text = ' | '.join(history[-2:])  # Ограничиваем 2 последними шагами
+            prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
+        
+        if verbose:
+            print(f"\nШаг {step+1}/{max_steps}")
+            print(f"Промпт:\n{prompt}")
 
-ОТВЕТЬТЕ ТОЛЬКО ЧИСЛОМ от 0 до 1 без пояснений:"""
-                else:
-                    # Последующие шаги с более директивным промптом
-                    prompt = f"""{system_prompt}
-
-История: {' | '.join(history)}
-Состояние: {state_text}
-
-ОТВЕТЬТЕ ТОЛЬКО ЧИСЛОМ от 0 до 1 без пояснений:"""
-                
-                # Токенизируем промпт
-                input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
-                
-                # Ограничиваем максимальное количество новых токенов для экономии места
-                # local_gen_config = gen_config.copy()  # У GenerationConfig нет метода copy()
-                
-                # Создаем конфигурацию, которая генерирует более предсказуемые ответы
-                local_gen_config = GenerationConfig(
-                    max_new_tokens=5,  # Нам нужно только короткое число
-                    do_sample=True,   # Не используем сэмплирование для чисел
-                    temperature=0.3,  # Очень низкая температура
-                    top_p=1.0,         # Не используем top-p фильтрацию
-                )
-                
-                # Логирование для отладки
-                print(f"{COLOR_BLUE}Шаг {episode_steps+1}:{COLOR_RESET}")
-                
-                # Генерируем ответ
-                with torch.no_grad():
-                    try:
-                        output = model.generate(
-                            input_ids=input_ids,
-                            generation_config=local_gen_config,
-                        )
-                    except Exception as e:
-                        print(f"{COLOR_RED}Ошибка при генерации ответа: {e}{COLOR_RESET}")
-                        # Используем запасной вариант действия
-                        action = 0.5
-                        response = f"0.5"
-                        # Создаем фиктивные токены
-                        new_tokens = tokenizer(response, return_tensors="pt").input_ids[0]
-                        output = torch.cat([input_ids[0], new_tokens])
-                        output = output.unsqueeze(0)
-                
-                # Получаем только новые токены (без промпта)
-                new_tokens = output[0, input_ids.shape[1]:]
-                
-                # Декодируем ответ
-                response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-                print(f"{COLOR_GREEN}Ответ модели:{COLOR_RESET} '{response}'")
-                
-                # Очищаем ответ от символов, которые модель часто повторяет
-                response = re.sub(r'(\*+)', '', response)  # Удаляем звездочки
-                response = re.sub(r'`+', '', response)      # Удаляем обратные кавычки
-                response = re.sub(r'\s+', ' ', response).strip()  # Нормализуем пробелы
-                
-                # Извлекаем действие из ответа
-                action = parse_llm_action(response)
-                print(f"{COLOR_YELLOW}Извлеченное действие:{COLOR_RESET} {action:.4f}")
-                episode_actions.append(action)
-                
-                # Обновляем историю - сохраняем только самую краткую запись состояний и действий
-                history.append(f"Сост:{format_short_state(state)}, Д:{action:.2f}")
-                
-                # Применяем действие к симулятору
-                try:
-                    next_state, reward, done, info = simulator.step(action)
-                    if hasattr(simulator, 'current_rate'):
-                        curr_rate = simulator.current_rate
-                        print(f"{COLOR_CYAN}Текущий дебит:{COLOR_RESET} {curr_rate:.2f} м³/сут")
-                    if hasattr(simulator, 'reservoir_pressure'):
-                        print(f"{COLOR_CYAN}Давление в пласте:{COLOR_RESET} {simulator.reservoir_pressure:.2f} атм")
-                except Exception as e:
-                    print(f"{COLOR_RED}Ошибка при применении действия: {e}{COLOR_RESET}")
-                    # Если произошла ошибка в симуляторе, завершаем эпизод
-                    done = True
-                    reward = -10.0  # Штраф за ошибку
-                    # Создаем фиктивное следующее состояние
-                    next_state = state
-                
-                # Обновляем данные эпизода - сохраняем только минимальный набор токенов
-                # Не сохраняем токены промпта, а только токены ответа (фактического действия)
-                action_tokens = new_tokens[:5]  # Берем не более 5 токенов ответа
-                
-                # Преобразуем в тензор, если это еще не тензор (для случаев, когда создаются фиктивные токены)
-                if not isinstance(action_tokens, torch.Tensor):
-                    action_tokens = torch.tensor(action_tokens, device=model.device)
-                
-                # Убеждаемся, что тензор не пустой (минимум 1 токен)
-                if action_tokens.numel() == 0:
-                    action_tokens = torch.tensor([tokenizer.encode("0", add_special_tokens=False)[0]], 
-                                                device=model.device)
-                
-                episode_tokens.append(action_tokens)
-                
-                # Создаем маску действий - все токены ответа считаются действием
-                action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
-                episode_action_masks.append(action_mask)
-                
-                episode_rewards.append(reward)
-                
-                # Обновляем статистику эпизода
-                episode_reward += reward
-                episode_steps += 1
-                state = next_state
-                
-                # Сохраняем текущую добычу, если она доступна
-                current_production = 0
-                if hasattr(simulator, 'cumulative_production'):
-                    current_production = simulator.cumulative_production
-                    episode_production = current_production
-                
-                print(f"Шаг {episode_steps}: действие={action:.4f}, награда={reward:.4f}, общая награда={episode_reward:.4f}, добыча={current_production:.2f} м³")
+        # Токенизируем запрос
+        tokenized_prompt = tokenizer(
+            prompt, 
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(device)
+        
+        # Сохраняем длину запроса для создания маски действий
+        prompt_length = tokenized_prompt.input_ids.shape[1]
+        
+        # Генерируем ответ
+        with torch.no_grad():
+            output = model.generate(
+                **tokenized_prompt,
+                generation_config=GenerationConfig(
+                    max_new_tokens=max_new_tokens_per_step,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    pad_token_id=tokenizer.eos_token_id,
+                ),
+                return_dict_in_generate=True,
+                output_scores=True
+            )
+        
+        # Декодируем ответ
+        response_ids = output.sequences[0, prompt_length:]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        
+        # Парсим действие и получаем награды за форматирование
+        action_value, format_rewards = parse_llm_action(response_text)
+        
+        print(f"Симулятор: Ответ модели: '{response_text}'")
+        if action_value is not None:
+            print(f"Симулятор: Действие: {action_value:.4f}")
+        else:
+            print(f"Симулятор: Действие: ПРОПУЩЕНО из-за неправильного формата")
+        print(f"Симулятор: Награды за форматирование: {format_rewards}")
+        
+        # Сохраняем токены, действия, награды
+        full_sequence = torch.cat([tokenized_prompt.input_ids[0], response_ids])
+        episode_tokens.append(full_sequence)
+        
+        # Проверяем, правильный ли формат
+        if action_value is not None:
+            # Применяем действие к симулятору
+            simulator.step(action_value)
             
-            # Расчет времени выполнения эпизода
-            episode_time = time.time() - start_time
+            # Получаем новое состояние и награду
+            new_state = simulator.state
+            # Награда за шаг = добыча за текущий шаг
+            step_reward = new_state[2] - state[2] 
             
-            # Логируем результаты эпизода
-            print(f"{COLOR_CYAN}Эпизод {episode+1} завершен: шагов={episode_steps}, общая награда={episode_reward:.4f}, добыча={episode_production:.2f} м³, время={episode_time:.2f} с{COLOR_RESET}")
+            # Добавляем награды за форматирование ответа
+            format_reward = sum(format_rewards.values())
+            total_format_reward = format_reward
+            episode_format_rewards.append(format_rewards)
             
-            # Сохраняем статистику эпизода
-            episode_stats = {
-                "steps": episode_steps,
-                "reward": episode_reward,
-                "production": episode_production,
-                "time": episode_time,
-                "actions": episode_actions,
-            }
-            all_episode_stats.append(episode_stats)
+            # Общая награда включает награду за действие и за форматирование
+            full_step_reward = step_reward + total_format_reward
             
-            if logger is not None:
-                logger.add_scalar("reward/rollout", episode_reward, global_step + episode)
-                logger.add_scalar("steps/rollout", episode_steps, global_step + episode)
-                logger.add_scalar("time/rollout", episode_time, global_step + episode)
-                
-                if hasattr(simulator, 'cumulative_production'):
-                    logger.add_scalar("production/rollout", simulator.cumulative_production, global_step + episode)
-                
-                # Логирование действий
-                for step, action in enumerate(episode_actions):
-                    logger.add_scalar(f"action/episode_{episode}", action, step)
+            # Обновляем общую награду и добычу
+            total_reward += full_step_reward
+            episode_production = new_state[2]  # Общая добыча - третий элемент в state
             
-            # Добавляем данные эпизода в общий список
-            if len(episode_tokens) > 0:
-                # Соединяем все токены в одну последовательность для эпизода
-                try:
-                    all_episode_tokens.append(torch.cat(episode_tokens))
-                    all_action_masks.append(torch.cat(episode_action_masks))
-                    all_rewards.append(torch.tensor(episode_rewards, dtype=torch.float32))
-                except Exception as e:
-                    print(f"{COLOR_RED}Ошибка при объединении токенов: {e}, пропускаем эпизод{COLOR_RESET}")
-                    continue
+            episode_rewards.append(torch.tensor(full_step_reward))
+            episode_actions.append(action_value)
             
-        except Exception as e:
-            print(f"{COLOR_RED}Критическая ошибка в эпизоде {episode+1}: {e}{COLOR_RESET}")
-            import traceback
-            traceback.print_exc()
-            # Если произошла критическая ошибка, пропускаем этот эпизод
-            # Не добавляем этот эпизод в результаты
+            # Создаем маску для токенов действия
+            # Все токены ответа модели (отличные от промта) помечаются как действия
+            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool)
+            action_mask[prompt_length:] = True
+            episode_action_masks.append(action_mask)
+            
+            # Сохраняем позиции токенов действия для более точного распределения наград
+            action_positions = torch.arange(prompt_length, len(full_sequence))
+            episode_action_positions.append(action_positions)
+            
+            print(f"Симулятор: Шаг {step+1}, Награда: {full_step_reward:.4f}, Общая награда: {total_reward:.4f}, Добыча: {episode_production:.2f} м³")
+            
+            # Обновляем текущее состояние и сохраняем последнее успешное состояние
+            history.append(state_text)
+            state = new_state
+        else:
+            # Если формат неправильный, даем отрицательную награду, но не выполняем шаг симулятора
+            format_reward = sum(format_rewards.values())
+            total_format_reward = format_reward
+            episode_format_rewards.append(format_rewards)
+            
+            # Отрицательная награда только за формат
+            full_step_reward = total_format_reward
+            total_reward += full_step_reward
+            
+            episode_rewards.append(torch.tensor(full_step_reward))
+            episode_actions.append(0.0)  # Действие не выполнялось, но в списке должно быть значение
+            
+            # Создаем маску для токенов действия
+            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool)
+            action_mask[prompt_length:] = True
+            episode_action_masks.append(action_mask)
+            
+            # Сохраняем позиции токенов действия для более точного распределения наград
+            action_positions = torch.arange(prompt_length, len(full_sequence))
+            episode_action_positions.append(action_positions)
+            
+            print(f"Симулятор: Шаг {step+1} ПРОПУЩЕН из-за неправильного формата, Штраф: {full_step_reward:.4f}, Общая награда: {total_reward:.4f}")
+            skipped_steps += 1
+        
+        step += 1
+        
+        # Если слишком много пропущенных шагов подряд, прерываем эпизод
+        if skipped_steps > 5:
+            print(f"Симулятор: Слишком много пропущенных шагов, прерываем эпизод.")
+            break
     
-    # Сводная статистика по всем эпизодам
-    avg_reward = sum(stats["reward"] for stats in all_episode_stats) / len(all_episode_stats) if all_episode_stats else 0
-    avg_steps = sum(stats["steps"] for stats in all_episode_stats) / len(all_episode_stats) if all_episode_stats else 0
-    avg_production = sum(stats["production"] for stats in all_episode_stats) / len(all_episode_stats) if all_episode_stats else 0
+    # Объединяем все токены и маски для эпизода
+    if episode_tokens:
+        # Объединяем все последовательности в одну
+        episode_full_tokens = torch.cat(episode_tokens)
+        
+        # Создаем полную маску действий
+        episode_full_action_mask = torch.zeros(len(episode_full_tokens), dtype=torch.bool, device=device)
+        
+        # Заполняем маску на основе позиций
+        offset = 0
+        for action_mask in episode_action_masks:
+            length = len(action_mask)
+            episode_full_action_mask[offset:offset+length] = action_mask
+            offset += length
+        
+        # Собираем статистику эпизода
+        episode_stats = {
+            "reward": total_reward,
+            "production": episode_production,
+            "steps": step - 1,
+            "actions": episode_actions,
+            "format_rewards": episode_format_rewards,
+            "action_positions": episode_action_positions,
+            "skipped_steps": skipped_steps
+        }
+        
+        # Добавляем данные эпизода в общие списки
+        all_episodes_tokens.append(episode_full_tokens)
+        all_episodes_action_masks.append(episode_full_action_mask)
+        all_episodes_rewards.append(torch.tensor(episode_rewards))
+        all_episodes_stats.append(episode_stats)
     
-    print(f"{COLOR_MAGENTA}Итоги по {num_episodes} эпизодам:{COLOR_RESET}")
-    print(f"Средняя награда: {avg_reward:.4f}")
-    print(f"Среднее количество шагов: {avg_steps:.1f}")
-    print(f"Средняя добыча: {avg_production:.2f} м³")
-    
-    if logger is not None:
-        logger.add_scalar("summary/avg_reward", avg_reward, global_step)
-        logger.add_scalar("summary/avg_steps", avg_steps, global_step)
-        logger.add_scalar("summary/avg_production", avg_production, global_step)
-    
-    # Возвращаем данные в виде списков и статистику
-    return all_episode_tokens, all_action_masks, all_rewards, all_episode_stats
+    return all_episodes_tokens, all_episodes_action_masks, all_episodes_rewards, all_episodes_stats
 
 def format_state(state, simulator):
     """
@@ -1089,99 +1051,88 @@ def format_state(state, simulator):
         
         return result
 
-def parse_llm_action(response: str) -> float:
+def parse_llm_action(response: str) -> Tuple[Optional[float], Dict[str, float]]:
     """
-    Извлекает значение степени открытия штуцера из ответа языковой модели.
+    Extracts action values from the LLM response.
     
     Args:
-        response: Ответ от языковой модели
+        response (str): The LLM response text.
         
     Returns:
-        float: Значение степени открытия штуцера (от 0 до 1)
+        Tuple[Optional[float], Dict[str, float]]: A tuple containing the extracted action value (between 0 and 1 or None if format invalid)
+        and a dictionary of format rewards.
     """
     try:
-        # Очистка ответа
+        # Clean up the response
         clean_response = response.strip()
         
-        # Если ответ пустой, возвращаем значение по умолчанию
+        # If response is empty, return None to indicate invalid format
         if not clean_response:
-            print("\033[33mОтвет пустой. Используется значение по умолчанию: 0.5\033[0m")
-            return 0.5
+            print(f"Пустой ответ: действие не будет выполнено")
+            return None, {"empty_response": -1.0}
         
-        # Сначала проверим на явные случаи полного открытия/закрытия
-        if any(phrase in clean_response.lower() for phrase in ["полностью открыть", "максимально открыть", "открыть полностью"]):
-            print("Обнаружен запрос на полное открытие")
-            return 1.0
-        elif any(phrase in clean_response.lower() for phrase in ["полностью закрыть", "закрыть полностью", "закрыть штуцер"]):
-            print("Обнаружен запрос на полное закрытие")
-            return 0.0
+        # Проверяем правильный формат <parameter>число</parameter>
+        perfect_pattern = r'<parameter>(.*?)</parameter>'
+        perfect_match = re.search(perfect_pattern, clean_response, re.DOTALL)
         
-        # Пытаемся найти число в ответе - первое и самое строгое соответствие
-        # Ищем только число с опциональной десятичной точкой (\d+(\.\d+)?) 
-        # в начале строки (^) с возможными пробелами (\s*) перед и после него
-        strict_match = re.match(r'^\s*(\d+(?:\.\d+)?)\s*$', clean_response)
-        if strict_match:
-            value = float(strict_match.group(1))
-            # Нормализуем значение
-            if value > 1 and value <= 100:
-                print(f"Найдено число {value}, интерпретируем как процент и преобразуем в {value/100.0}")
-                value /= 100.0
-            # Ограничиваем диапазон
-            value = max(0.0, min(1.0, value))
-            return value
-            
-        # Если не нашли строгое соответствие, ищем любое число в строке
-        number_match = re.search(r'(\d+(?:\.\d+)?)', clean_response)
-        if number_match:
-            value = float(number_match.group(1))
-            # Нормализуем значение
-            if value > 1 and value <= 100:
-                print(f"Найдено число {value}, интерпретируем как процент и преобразуем в {value/100.0}")
-                value /= 100.0
-            # Ограничиваем диапазон
-            value = max(0.0, min(1.0, value))
-            print(f"\033[33mНайдено число в тексте: {value}, но ответ содержит лишний текст\033[0m")
-            return value
-            
-        # Если не удалось извлечь значение, используем расширенные паттерны
-        patterns = [
-            r"штуцер:?\s*(\d+(?:\.\d+)?)",
-            r"открыть штуцер на:?\s*(\d+(?:\.\d+)?)",
-            r"открытие:?\s*(\d+(?:\.\d+)?)",
-            r"степень открытия:?\s*(\d+(?:\.\d+)?)",
-            r"значение:?\s*(\d+(?:\.\d+)?)",
-            r"открыть на:?\s*(\d+(?:\.\d+)?)",
-            r"открыть клапан на:?\s*(\d+(?:\.\d+)?)",
-            r"установить на:?\s*(\d+(?:\.\d+)?)",
-            r"(\d+(?:\.\d+)?)\s*%",
-        ]
-        
-        # Ищем по всем паттернам
-        for pattern in patterns:
-            matches = re.findall(pattern, clean_response.lower())
-            if matches:
-                value = float(matches[0])
-                # Нормализуем значение
-                if value > 1 and value <= 100:
-                    value /= 100.0
-                # Ограничиваем диапазон
+        if perfect_match:
+            # Extract the value inside the tags
+            value_str = perfect_match.group(1).strip()
+            try:
+                value = float(value_str)
+                # Limit the range
                 value = max(0.0, min(1.0, value))
-                print(f"\033[33mНайдено число {value} по шаблону {pattern}\033[0m")
-                return value
+                # Идеальный формат, максимальная награда
+                return value, {"parameter_format": 1.0}
+            except ValueError:
+                # If the content inside tags is not a number, use default and give negative reward
+                print(f"Ошибка формата: тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
+                return None, {"parameter_not_number": -1.0}
         
-        # Если не удалось извлечь значение, используем значение по умолчанию
-        print(f"\033[31mОШИБКА: Не удалось извлечь числовое значение из ответа: '{clean_response}'\033[0m")
-        # Пробуем найти любые числа в ответе для отладки
-        all_numbers = re.findall(r'\d+(?:\.\d+)?', response)
-        if all_numbers:
-            print(f"\033[33mНайдены числа в ответе, но не распознаны как значение: {all_numbers}\033[0m")
+        # Более гибкий паттерн для случаев с незакрытыми тегами
+        flexible_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
+        flexible_match = re.search(flexible_pattern, clean_response, re.DOTALL)
         
-        # Возвращаем значение по умолчанию с высокой вероятностью получить нефть
-        print("\033[33mИспользуется значение по умолчанию: 0.5\033[0m")
-        return 0.5
+        if flexible_match:
+            # Extract the value inside the tags
+            value_str = flexible_match.group(1).strip()
+            try:
+                value = float(value_str)
+                # Limit the range
+                value = max(0.0, min(1.0, value))
+                # Почти правильный формат, положительная но не максимальная награда
+                print(f"Неполный формат тегов: {clean_response}. Действие будет выполнено, но в следующий раз используйте корректный формат.")
+                return value, {"almost_parameter_format": 0.6}
+            except ValueError:
+                # If the content inside tags is not a number, use default and give negative reward
+                print(f"Ошибка формата: неполный тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
+                return None, {"parameter_not_number": -1.0}
+        
+        # Ищем число в тексте для использования как значение (но даем отрицательную награду)
+        number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
+        number_match = re.search(number_pattern, clean_response)
+        if number_match:
+            print(f"Найдено число без правильного формата: {clean_response}. Действие не будет выполнено, используйте формат <parameter>число</parameter>.")
+            return None, {"wrong_format_with_number": -0.8}
+        
+        # Check for explicit cases of full opening/closing for value extraction
+        if any(phrase in clean_response.lower() for phrase in ["fully open", "maximum open", "completely open", "полностью открыть"]):
+            print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>1.0</parameter>")
+            return None, {"wrong_format_open": -0.8}
+        elif any(phrase in clean_response.lower() for phrase in ["fully close", "completely close", "close the choke", "полностью закрыть"]):
+            print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.0</parameter>")
+            return None, {"wrong_format_close": -0.8}
+        elif any(phrase in clean_response.lower() for phrase in ["no change", "maintain", "keep", "без изменений", "сохранить"]):
+            print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.5</parameter>")
+            return None, {"wrong_format_maintain": -0.8}
+        
+        # If unable to extract a value, use the default
+        print(f"Не удалось извлечь значение из ответа: '{clean_response}'. Действие не будет выполнено.")
+        return None, {"wrong_format_default": -1.0}
     except Exception as e:
-        print(f"\033[31mОшибка при обработке ответа модели: {e}\nОтвет: '{response}'\033[0m")
-        return 0.5  # Возвращаем среднее значение по умолчанию
+        # In case of any error, return None to indicate invalid format
+        print(f"Ошибка при обработке ответа: {str(e)}. Действие не будет выполнено.")
+        return None, {"error": -1.0}
 
 def calculate_discounted_returns(rewards, gamma=0.99):
     """
@@ -1450,6 +1401,19 @@ def main():
                         actions_data["actions"].append(step_action)
                 
                 actions_batch.append(actions_data)
+        
+        # Проверяем, что были собраны эпизоды
+        # Преобразуем списки в тензоры
+        if "logits" not in model_batch_data or not model_batch_data["logits"]:
+            print(f"{COLOR_RED}Не удалось собрать ни одного эпизода. Пропускаем шаг обучения.{COLOR_RESET}")
+            # Увеличиваем счетчик глобальных шагов и продолжаем
+            global_step += 1
+            continue
+
+            print(f"{COLOR_RED}Не удалось собрать ни одного эпизода. Пропускаем шаг обучения.{COLOR_RESET}")
+            # Увеличиваем счетчик глобальных шагов и продолжаем
+            global_step += 1
+            continue
         
         # Преобразуем списки в тензоры
         model_batch_data["logits"] = torch.stack(model_batch_data["logits"])

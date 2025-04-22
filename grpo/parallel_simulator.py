@@ -4,10 +4,11 @@ import torch
 import re
 import time
 import numpy as np
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Any, Union
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, GenerationConfig
 from simulators.single_well.simulator import SingleWellSimulator
 from simulators.multi_well.simulator import MultiWellSimulator
+from grpo.prompts import get_first_step_prompt, get_subsequent_step_prompt, BASE_PROMPT_TEMPLATE
 
 # Константы для цветов в консоли
 COLOR_RESET = "\033[0m"
@@ -117,35 +118,21 @@ class ParallelSimulator:
             simulator = self.simulators[i]
             state_text = self.format_state(state, simulator)
             
-            # Формируем промпт в зависимости от типа симулятора
-            if hasattr(simulator, 'well_names') and len(getattr(simulator, 'well_names', [])) > 1:
-                system_prompt = """ЗАДАЧА: Управление добычей нефти в нескольких скважинах.
-ТРЕБУЕТСЯ: Указать степень открытия штуцера от 0 до 1.
-ФОРМАТ ОТВЕТА: Только число от 0 до 1, без текста."""
-            else:
-                system_prompt = """ЗАДАЧА: Управление добычей нефти в одной скважине.
-ТРЕБУЕТСЯ: Указать степень открытия штуцера от 0 до 1.
-ФОРМАТ ОТВЕТА: Только число от 0 до 1, без текста."""
+            # Проверяем тип симулятора (одна или несколько скважин)
+            is_multi_well = hasattr(simulator, 'well_names') and len(getattr(simulator, 'well_names', [])) > 1
             
             # Ограничиваем историю до 2 последних взаимодействий для экономии токенов
             if len(history) > 2:
                 history = history[-2:]
             
+            # Используем разные шаблоны в зависимости от наличия истории
             if not history:
-                # Первый шаг эпизода - более директивный промпт
-                prompt = f"""{system_prompt}
-
-Состояние: {state_text}
-
-ОТВЕТЬТЕ ТОЛЬКО ЧИСЛОМ от 0 до 1 без пояснений:"""
+                # Первый шаг эпизода
+                prompt = get_first_step_prompt(state_text, is_multi_well)
             else:
-                # Последующие шаги с более директивным промптом
-                prompt = f"""{system_prompt}
-
-История: {' | '.join(history)}
-Состояние: {state_text}
-
-ОТВЕТЬТЕ ТОЛЬКО ЧИСЛОМ от 0 до 1 без пояснений:"""
+                # Последующие шаги с историей
+                history_text = ' | '.join(history)
+                prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
             
             prompts.append(prompt)
         
@@ -207,59 +194,97 @@ class ParallelSimulator:
             # Если формат состояния неизвестен, возвращаем просто числа
             return ", ".join([f"{x:.1f}" for x in state])
     
-    def parse_llm_action(self, response: str) -> float:
+    def parse_llm_action(self, response: str) -> Tuple[Optional[float], Dict[str, float]]:
         """
-        Извлекает значение степени открытия штуцера из ответа языковой модели.
+        Extracts the action value from the LLM response.
+        
+        Args:
+            response (str): The LLM response text.
+            
+        Returns:
+            Tuple[Optional[float], Dict[str, float]]: A tuple containing the extracted action value (between 0 and 1 or None if format invalid)
+            and a dictionary of format rewards.
         """
         try:
-            # Очистка ответа
+            # Clean up the response
             clean_response = response.strip()
             
-            # Если ответ пустой, возвращаем значение по умолчанию
+            # If response is empty, return None to indicate invalid format
             if not clean_response:
-                return 0.5
+                print(f"Пустой ответ: действие не будет выполнено")
+                return None, {"empty_response": -1.0}
             
-            # Сначала проверим на явные случаи полного открытия/закрытия
-            if any(phrase in clean_response.lower() for phrase in ["полностью открыть", "максимально открыть", "открыть полностью"]):
-                return 1.0
-            elif any(phrase in clean_response.lower() for phrase in ["полностью закрыть", "закрыть полностью", "закрыть штуцер"]):
-                return 0.0
+            # Проверяем правильный формат <parameter>число</parameter>
+            perfect_pattern = r'<parameter>(.*?)</parameter>'
+            perfect_match = re.search(perfect_pattern, clean_response, re.DOTALL)
             
-            # Пытаемся найти число в ответе - первое и самое строгое соответствие
-            strict_match = re.match(r'^\s*(\d+(?:\.\d+)?)\s*$', clean_response)
-            if strict_match:
-                value = float(strict_match.group(1))
-                # Нормализуем значение
-                if value > 1 and value <= 100:
-                    value /= 100.0
-                # Ограничиваем диапазон
-                value = max(0.0, min(1.0, value))
-                return value
-                
-            # Если не нашли строгое соответствие, ищем любое число в строке
-            number_match = re.search(r'(\d+(?:\.\d+)?)', clean_response)
+            if perfect_match:
+                # Extract the value inside the tags
+                value_str = perfect_match.group(1).strip()
+                try:
+                    value = float(value_str)
+                    # Limit the range
+                    value = max(0.0, min(1.0, value))
+                    # Идеальный формат, максимальная награда
+                    return value, {"parameter_format": 1.0}
+                except ValueError:
+                    # If the content inside tags is not a number, use default and give negative reward
+                    print(f"Ошибка формата: тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
+                    return None, {"parameter_not_number": -1.0}
+            
+            # Более гибкий паттерн для случаев с незакрытыми тегами
+            flexible_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
+            flexible_match = re.search(flexible_pattern, clean_response, re.DOTALL)
+            
+            if flexible_match:
+                # Extract the value inside the tags
+                value_str = flexible_match.group(1).strip()
+                try:
+                    value = float(value_str)
+                    # Limit the range
+                    value = max(0.0, min(1.0, value))
+                    # Почти правильный формат, положительная но не максимальная награда
+                    print(f"Неполный формат тегов: {clean_response}. Действие будет выполнено, но в следующий раз используйте корректный формат.")
+                    return value, {"almost_parameter_format": 0.6}
+                except ValueError:
+                    # If the content inside tags is not a number, use default and give negative reward
+                    print(f"Ошибка формата: неполный тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
+                    return None, {"parameter_not_number": -1.0}
+            
+            # Ищем число в тексте для использования как значение (но даем отрицательную награду)
+            number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
+            number_match = re.search(number_pattern, clean_response)
             if number_match:
-                value = float(number_match.group(1))
-                # Нормализуем значение
-                if value > 1 and value <= 100:
-                    value /= 100.0
-                # Ограничиваем диапазон
-                value = max(0.0, min(1.0, value))
-                return value
+                print(f"Найдено число без правильного формата: {clean_response}. Действие не будет выполнено, используйте формат <parameter>число</parameter>.")
+                return None, {"wrong_format_with_number": -0.8}
             
-            # Если не удалось извлечь значение, используем значение по умолчанию
-            return 0.5
+            # Check for explicit cases of full opening/closing for value extraction
+            if any(phrase in clean_response.lower() for phrase in ["fully open", "maximum open", "completely open", "полностью открыть"]):
+                print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>1.0</parameter>")
+                return None, {"wrong_format_open": -0.8}
+            elif any(phrase in clean_response.lower() for phrase in ["fully close", "completely close", "close the choke", "полностью закрыть"]):
+                print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.0</parameter>")
+                return None, {"wrong_format_close": -0.8}
+            elif any(phrase in clean_response.lower() for phrase in ["no change", "maintain", "keep", "без изменений", "сохранить"]):
+                print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.5</parameter>")
+                return None, {"wrong_format_maintain": -0.8}
+            
+            # If unable to extract a value, use the default
+            print(f"Не удалось извлечь значение из ответа: '{clean_response}'. Действие не будет выполнено.")
+            return None, {"wrong_format_default": -1.0}
         except Exception as e:
-            # При любой ошибке возвращаем безопасное значение
-            return 0.5
+            # In case of any error, return None to indicate invalid format
+            print(f"Ошибка при обработке ответа: {str(e)}. Действие не будет выполнено.")
+            return None, {"error": -1.0}
 
 
 def parallel_rollout(
     model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizer,
     parallel_sim: ParallelSimulator,
-    n_steps: int = 10,
-    temperature: float = 0.3,
+    n_steps: int = 20,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
     verbose: bool = True,
 ) -> Tuple[
     List[torch.Tensor],   # all_episode_tokens
@@ -276,6 +301,7 @@ def parallel_rollout(
         parallel_sim: Объект класса ParallelSimulator
         n_steps: Максимальное количество шагов для каждого роллаута
         temperature: Температура генерации
+        top_p: Параметр top_p для генерации
         verbose: Выводить ли информацию в консоль
     
     Returns:
@@ -299,6 +325,7 @@ def parallel_rollout(
     # Инициализируем счетчики для отслеживания прогресса
     steps_completed = [0] * n_simulators
     episodes_done = [False] * n_simulators
+    skipped_steps = [0] * n_simulators  # Счетчик пропущенных шагов для каждого симулятора
     
     # Истории для каждого симулятора
     histories = [[] for _ in range(n_simulators)]
@@ -310,15 +337,18 @@ def parallel_rollout(
     episode_actions_list = [[] for _ in range(n_simulators)]
     episode_total_rewards = [0.0] * n_simulators
     episode_production = [0.0] * n_simulators
+    episode_format_rewards_list = [[] for _ in range(n_simulators)]  # Добавляем список для хранения формата наград
     
     start_time = time.time()
     
     # Создаем конфигурацию генерации
     generation_config = GenerationConfig(
-        max_new_tokens=5,  # Нам нужно только короткое число
-        do_sample=True,    # Сэмплирование для разнообразия
+        max_new_tokens=10,  # Ограничиваем длину генерации для эффективности
+        do_sample=True,
         temperature=temperature,
-        top_p=0.95,
+        top_p=top_p,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
     
     # Выполняем шаги для всех симуляторов
@@ -359,6 +389,8 @@ def parallel_rollout(
         
         # Извлекаем новые токены и действия
         actions = []
+        valid_actions = []  # Список для хранения валидных действий
+        valid_indices = []  # Список для хранения индексов валидных действий
         for i, idx in enumerate(active_indices):
             # Получаем только новые токены (без промпта)
             # Batch size может быть > 1, поэтому берем соответствующую строку
@@ -376,18 +408,37 @@ def parallel_rollout(
             response = re.sub(r'\s+', ' ', response).strip()  # Нормализуем пробелы
             
             # Извлекаем действие из ответа
-            action = parallel_sim.parse_llm_action(response)
-            if verbose:
-                print(f"Симулятор {idx+1}: {COLOR_YELLOW}Действие:{COLOR_RESET} {action:.4f}")
+            action, format_rewards = parallel_sim.parse_llm_action(response)
             
-            actions.append(action)
-            episode_actions_list[idx].append(action)
+            if action is not None:
+                if verbose:
+                    print(f"Симулятор {idx+1}: {COLOR_YELLOW}Действие:{COLOR_RESET} {action:.4f}")
+                    print(f"Симулятор {idx+1}: {COLOR_BLUE}Награды за форматирование:{COLOR_RESET} {format_rewards}")
+                
+                # Сохраняем действие и индекс
+                valid_actions.append(action)
+                valid_indices.append(i)
+                skipped_steps[idx] = 0  # Сбрасываем счетчик пропущенных шагов
+            else:
+                if verbose:
+                    print(f"Симулятор {idx+1}: {COLOR_RED}Действие пропущено из-за неправильного формата{COLOR_RESET}")
+                    print(f"Симулятор {idx+1}: {COLOR_BLUE}Штраф за форматирование:{COLOR_RESET} {format_rewards}")
+                
+                # Отмечаем шаг как пропущенный и увеличиваем счетчик
+                skipped_steps[idx] += 1
+                
+                # Если слишком много пропущенных шагов подряд, завершаем эпизод
+                if skipped_steps[idx] > 5:
+                    if verbose:
+                        print(f"{COLOR_RED}Симулятор {idx+1}: Слишком много пропущенных шагов подряд, завершаем эпизод.{COLOR_RESET}")
+                    episodes_done[idx] = True
             
-            # Обновляем историю
-            current_state = parallel_sim.current_states[idx]
-            histories[idx].append(f"Сост:{parallel_sim.format_short_state(current_state)}, Д:{action:.2f}")
+            # Заполняем пустым значением (будет игнорироваться, если шаг пропущен)
+            actions.append(action if action is not None else 0.0)
+            episode_actions_list[idx].append(action if action is not None else 0.0)
+            episode_format_rewards_list[idx].append(format_rewards)  # Сохраняем формат наград
             
-            # Сохраняем токены действия
+            # Сохраняем токены действия в любом случае (для обучения)
             action_tokens = new_tokens
             
             # Убеждаемся, что тензор не пустой
@@ -398,78 +449,101 @@ def parallel_rollout(
             episode_tokens_list[idx].append(action_tokens)
             
             # Создаем маску действий - улучшенная версия
-            # Находим числовое значение в ответе (это и есть действие)
-            numeric_pattern = re.compile(r'[0-9]*\.?[0-9]+')
-            numeric_match = numeric_pattern.search(response)
-            
-            # По умолчанию маскируем все нулями
-            action_mask = torch.zeros_like(action_tokens, dtype=torch.bool)
-            
-            if numeric_match:
-                # Если нашли число, маскируем только токены, соответствующие числу
-                numeric_text = numeric_match.group(0)
-                # Получаем токены числа
-                numeric_tokens = tokenizer.encode(numeric_text, add_special_tokens=False)
-                
-                # Маскируем токены, соответствующие числу
-                for i, token_id in enumerate(action_tokens):
-                    if token_id.item() in numeric_tokens:
-                        action_mask[i] = True
-            else:
-                # Если число не найдено, используем весь ответ (это плохо, но лучше чем ничего)
-                action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
-                
+            # Маскируем все токены ответа, независимо от того, валидный формат или нет
+            action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
             episode_action_masks_list[idx].append(action_mask)
+            
+            # Добавляем информацию в историю только если действие было валидным
+            if action is not None:
+                current_state = parallel_sim.current_states[idx]
+                histories[idx].append(f"Сост:{parallel_sim.format_short_state(current_state)}, Д:{action:.2f}")
         
-        # Выполняем шаг для активных симуляторов
-        # Подготавливаем действия для всех симуляторов (заполняем пустышками для неактивных)
-        all_actions = [0.0] * n_simulators
-        for i, idx in enumerate(active_indices):
-            all_actions[idx] = actions[i]
-        
-        # Выполняем шаг параллельно для всех симуляторов
-        results = parallel_sim.step(all_actions)
-        
-        # Обрабатываем результаты
-        for idx, (next_state, reward, done, info) in enumerate(results):
-            # Пропускаем неактивные симуляторы
-            if episodes_done[idx]:
-                continue
+        # Если есть валидные действия, выполняем шаг для соответствующих симуляторов
+        if valid_actions:
+            # Заполняем действия для всех симуляторов (нули для симуляторов с невалидными ответами)
+            all_actions = [0.0] * n_simulators
             
-            # Обновляем данные для активного симулятора
-            episode_rewards_list[idx].append(reward)
-            episode_total_rewards[idx] += reward
-            steps_completed[idx] += 1
+            # Заполняем только для активных симуляторов с валидными действиями
+            for i, idx in enumerate(valid_indices):
+                act_idx = active_indices[idx]
+                all_actions[act_idx] = valid_actions[i]
             
-            # Обновляем информацию о добыче
-            if hasattr(parallel_sim.simulators[idx], 'cumulative_production'):
-                episode_production[idx] = parallel_sim.simulators[idx].cumulative_production
+            # Выполняем шаг параллельно для всех симуляторов
+            results = parallel_sim.step(all_actions)
             
-            if verbose:
-                print(f"Симулятор {idx+1}: Шаг {steps_completed[idx]}, Награда: {reward:.4f}, "
-                    f"Общая награда: {episode_total_rewards[idx]:.4f}, "
-                    f"Добыча: {episode_production[idx]:.2f} м³")
-            
-            # Проверяем завершение эпизода
-            if done:
-                episodes_done[idx] = True
+            # Обрабатываем результаты
+            for idx, (next_state, reward, done, info) in enumerate(results):
+                # Пропускаем неактивные симуляторы или те, где формат был неправильный
+                if episodes_done[idx] or idx not in [active_indices[i] for i in valid_indices]:
+                    continue
+                
+                # Обновляем данные для активного симулятора
+                episode_rewards_list[idx].append(reward + sum(episode_format_rewards_list[idx][-1].values()))
+                full_reward = reward + sum(episode_format_rewards_list[idx][-1].values())
+                episode_total_rewards[idx] += full_reward
+                steps_completed[idx] += 1
+                
+                # Обновляем информацию о добыче
+                if hasattr(parallel_sim.simulators[idx], 'cumulative_production'):
+                    episode_production[idx] = parallel_sim.simulators[idx].cumulative_production
+                
                 if verbose:
-                    print(f"{COLOR_MAGENTA}Симулятор {idx+1}: Эпизод завершен после {steps_completed[idx]} шагов.{COLOR_RESET}")
+                    print(f"Симулятор {idx+1}: Шаг {steps_completed[idx]}, Награда: {reward:.4f}, "
+                        f"Общая награда: {episode_total_rewards[idx]:.4f}, "
+                        f"Добыча: {episode_production[idx]:.2f} м³")
+                
+                # Если эпизод завершен, отмечаем его
+                episodes_done[idx] = done
+                
+                if done:
+                    if verbose:
+                        print(f"{COLOR_MAGENTA}Симулятор {idx+1}: Эпизод завершен после {steps_completed[idx]} шагов.{COLOR_RESET}")
+        else:
+            # Если нет валидных действий, добавляем штрафы за формат для всех активных симуляторов
+            for i, idx in enumerate(active_indices):
+                format_reward = sum(episode_format_rewards_list[idx][-1].values())
+                episode_rewards_list[idx].append(format_reward)
+                episode_total_rewards[idx] += format_reward
+                
+                if verbose:
+                    print(f"Симулятор {idx+1}: Шаг пропущен, Штраф за формат: {format_reward:.4f}, "
+                        f"Общая награда: {episode_total_rewards[idx]:.4f}")
     
     # После завершения всех шагов собираем финальные данные
     for idx in range(n_simulators):
-        # Пропускаем пустые эпизоды (хотя таких быть не должно)
-        if not episode_tokens_list[idx]:
-            continue
-        
-        # Собираем токены эпизода
         try:
-            episode_tokens = torch.cat(episode_tokens_list[idx])
-            episode_action_masks = torch.cat(episode_action_masks_list[idx])
-            episode_rewards = torch.tensor(episode_rewards_list[idx], dtype=torch.float32)
+            # Пропускаем симуляторы, которые не начали работу
+            if steps_completed[idx] == 0:
+                continue
+                
+            # Собираем токены для эпизода
+            all_tokens = []
+            all_masks = []
+            
+            for step_tokens, step_masks in zip(episode_tokens_list[idx], episode_action_masks_list[idx]):
+                all_tokens.append(step_tokens)
+                all_masks.append(step_masks)
+            
+            # Проверяем, есть ли хоть какие-то токены
+            if not all_tokens:
+                if verbose:
+                    print(f"{COLOR_RED}Симулятор {idx+1}: Нет сохраненных токенов, пропускаем.{COLOR_RESET}")
+                continue
+            
+            # Объединяем токены и маски в один тензор для эпизода
+            try:
+                episode_tokens = torch.cat(all_tokens)
+                episode_masks = torch.cat(all_masks)
+            except Exception as e:
+                if verbose:
+                    print(f"{COLOR_RED}Симулятор {idx+1}: Ошибка при объединении токенов: {e}{COLOR_RESET}")
+                continue
             
             all_episode_tokens.append(episode_tokens)
-            all_action_masks.append(episode_action_masks)
+            all_action_masks.append(episode_masks)
+            
+            # Преобразуем награды в тензор
+            episode_rewards = torch.tensor(episode_rewards_list[idx], device=device)
             all_rewards.append(episode_rewards)
             
             # Собираем статистику эпизода
@@ -479,22 +553,18 @@ def parallel_rollout(
                 "production": episode_production[idx],
                 "time": time.time() - start_time,
                 "actions": episode_actions_list[idx],
+                "format_rewards": episode_format_rewards_list[idx],
+                "skipped_steps": skipped_steps[idx]
             }
             all_episode_stats.append(episode_stats)
             
         except Exception as e:
             if verbose:
-                print(f"{COLOR_RED}Ошибка при обработке эпизода {idx+1}: {e}{COLOR_RESET}")
+                print(f"{COLOR_RED}Симулятор {idx+1}: Ошибка при сборе финальных данных: {e}{COLOR_RESET}")
     
-    # Выводим итоговую статистику
+    elapsed_time = time.time() - start_time
     if verbose:
-        avg_reward = sum(stats["reward"] for stats in all_episode_stats) / len(all_episode_stats) if all_episode_stats else 0
-        avg_steps = sum(stats["steps"] for stats in all_episode_stats) / len(all_episode_stats) if all_episode_stats else 0
-        avg_production = sum(stats["production"] for stats in all_episode_stats) / len(all_episode_stats) if all_episode_stats else 0
-        
-        print(f"\n{COLOR_MAGENTA}Итоги по {len(all_episode_stats)} эпизодам:{COLOR_RESET}")
-        print(f"Средняя награда: {avg_reward:.4f}")
-        print(f"Среднее количество шагов: {avg_steps:.1f}")
-        print(f"Средняя добыча: {avg_production:.2f} м³")
+        print(f"\n{COLOR_GREEN}Роллауты завершены. Время выполнения: {elapsed_time:.2f} с.{COLOR_RESET}")
+        print(f"Собрано {len(all_episode_tokens)} эпизодов.")
     
     return all_episode_tokens, all_action_masks, all_rewards, all_episode_stats 
