@@ -30,7 +30,7 @@
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/yourusername/re-oil-production-llm.git
+git clone https://github.com/researchim-ai/re-oil-production-llm.git
 cd re-oil-production-llm
 ```
 
