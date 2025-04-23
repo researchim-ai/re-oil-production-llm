@@ -31,22 +31,25 @@ class SingleWellSimulator:
 
     def reset(self) -> np.ndarray:
         """
-        Сбрасывает симулятор к начальному состоянию.
-        Возвращает:
-            np.ndarray: Начальное состояние [reservoir_pressure, flow_rate, cumulative_production, time]
+        Сбрасывает симулятор в начальное состояние.
+        
+        Returns:
+            np.ndarray: Начальное состояние [давление, дебит, добыча, время]
         """
+        # Начальные условия
         self.reservoir_pressure = self.initial_reservoir_pressure
-        self.bhp = self.initial_bhp
-        self.flow_rate = 0.0
+        self.flow_rate = 0.0 # Нет начального дебита, пока не открыт штуцер
         self.cumulative_production = 0.0
         self.time = 0.0
-        # Возвращаем начальное состояние как numpy массив
+        self.previous_choke = 0.0  # Инициализируем значение предыдущего положения штуцера
+        
         self.state = np.array([
             self.reservoir_pressure,
             self.flow_rate,
             self.cumulative_production,
             self.time
         ])
+        
         return self.state
 
     def step(self, action: float) -> tuple[np.ndarray, float, bool, dict]:
@@ -69,7 +72,7 @@ class SingleWellSimulator:
 
         # 2. Рассчитываем дебит (упрощенная модель притока)
         # Учитываем, что давление в пласте не может быть ниже BHP
-        delta_p = max(0.0, self.reservoir_pressure - self.bhp)
+        delta_p = max(0.0, self.reservoir_pressure - self.initial_bhp)
         # Дебит зависит от перепада давления и открытия штуцера
         current_flow_rate = self.pi * delta_p * choke_opening
         self.current_rate = current_flow_rate  # Сохраняем текущий дебит
@@ -107,17 +110,85 @@ class SingleWellSimulator:
         reward = current_flow_rate / 10
         
         # Улучшенная функция награды с reward shaping
-        # Бонус за поддержание высокого давления пласта (устойчивая добыча)
-        if self.reservoir_pressure > 0.5 * self.initial_reservoir_pressure:
-            reward *= 1.2  # Бонус за сохранение высокого давления
         
-        # Штраф за слишком интенсивную добычу на ранних стадиях
-        if self.time < 0.3 * self.max_time and current_flow_rate > 0.7 * self.pi * self.initial_reservoir_pressure:
-            reward *= 0.8  # Штраф за слишком агрессивную эксплуатацию в начале
-
+        # Фазы разработки скважины
+        early_phase = self.time < 0.25 * self.max_time  # Ранняя фаза
+        mid_phase = 0.25 * self.max_time <= self.time < 0.7 * self.max_time  # Средняя фаза
+        late_phase = self.time >= 0.7 * self.max_time  # Поздняя фаза
+        
+        # Стратегический коэффициент для текущей фазы (влияет на размер награды)
+        strategic_factor = 1.0
+        
+        # Бонусы и штрафы зависят от фазы разработки
+        if early_phase:
+            # Ранняя фаза: поощряем умеренную добычу для сохранения давления
+            optimal_choke = 0.3  # Оптимальная степень открытия штуцера в начале
+            strategic_factor = 1.0 - 2.0 * abs(choke_opening - optimal_choke)  # Максимум при optimal_choke
+            
+            # Дополнительный штраф за слишком интенсивную добычу в начале
+            if choke_opening > 0.6:
+                reward *= 0.5  # Существенный штраф
+            
+            # Бонус за поддержание высокого давления
+            if self.reservoir_pressure > 0.8 * self.initial_reservoir_pressure:
+                reward *= 1.5
+        
+        elif mid_phase:
+            # Средняя фаза: поощряем стабильную добычу
+            optimal_choke = 0.5  # Оптимальная степень открытия штуцера в середине
+            strategic_factor = 1.0 - 1.5 * abs(choke_opening - optimal_choke)
+            
+            # Бонус за поддержание стабильного дебита
+            if 0.4 <= choke_opening <= 0.6:
+                reward *= 1.3
+        
+        else:  # late_phase
+            # Поздняя фаза: поощряем максимальную добычу
+            optimal_choke = 0.8  # Оптимальная степень открытия штуцера в конце
+            strategic_factor = 1.0 - 1.0 * abs(choke_opening - optimal_choke)
+            
+            # Бонус за максимальную добычу в конце
+            if choke_opening > 0.7:
+                reward *= 1.4
+        
+        # Применяем стратегический коэффициент (минимум 0.2)
+        strategic_factor = max(0.2, strategic_factor)
+        reward *= strategic_factor
+        
+        # Бонус за оптимальную последовательность действий между шагами
+        # Оцениваем изменение открытия штуцера относительно предыдущего шага
+        if hasattr(self, 'previous_choke') and self.time > self.dt:
+            # Идеальное изменение зависит от фазы
+            if early_phase:
+                # В начале - плавное увеличение
+                ideal_change = 0.05  # Небольшое увеличение
+            elif mid_phase:
+                # В середине - стабильность
+                ideal_change = 0.0  # Минимальное изменение
+            else:  # late_phase
+                # В конце - более существенное увеличение
+                ideal_change = 0.1  # Значительное увеличение
+            
+            # Рассчитываем фактическое изменение
+            actual_change = choke_opening - self.previous_choke
+            
+            # Оцениваем, насколько хорошо изменение соответствует идеальному
+            sequence_factor = 1.0 - 2.0 * abs(actual_change - ideal_change)
+            sequence_factor = max(0.3, sequence_factor)  # Ограничиваем минимальный множитель
+            
+            # Применяем множитель для последовательности
+            reward *= sequence_factor
+            
+            # Штраф за резкие изменения (высокая волатильность вредна для оборудования)
+            if abs(actual_change) > 0.3:
+                reward *= 0.7  # Существенный штраф за резкие изменения
+        
+        # Сохраняем текущее открытие штуцера для следующего шага
+        self.previous_choke = choke_opening
+        
         # 8. Проверяем условие завершения эпизода
         # Завершаем, если время вышло или давление пласта упало ниже BHP (приток прекратился)
-        done = self.time >= self.max_time or self.reservoir_pressure <= self.bhp
+        done = self.time >= self.max_time or self.reservoir_pressure <= self.initial_bhp
 
         # 9. Формируем информационный словарь
         info = {

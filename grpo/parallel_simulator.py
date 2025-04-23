@@ -8,7 +8,7 @@ from typing import List, Tuple, Dict, Optional, Any, Union
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, GenerationConfig
 from simulators.single_well.simulator import SingleWellSimulator
 from simulators.multi_well.simulator import MultiWellSimulator
-from grpo.prompts import get_first_step_prompt, get_subsequent_step_prompt, BASE_PROMPT_TEMPLATE
+from grpo.prompts import get_first_step_prompt, get_subsequent_step_prompt, BASE_PROMPT_TEMPLATE, get_reasoning_first_step_prompt, get_reasoning_subsequent_step_prompt
 
 # Константы для цветов в консоли
 COLOR_RESET = "\033[0m"
@@ -100,12 +100,13 @@ class ParallelSimulator:
         
         return results
     
-    def get_prompts(self, histories: Optional[List[List[str]]] = None) -> List[str]:
+    def get_prompts(self, histories: Optional[List[List[str]]] = None, prompt_type: str = "standard") -> List[str]:
         """
         Формирует промпты для всех симуляторов с учетом их текущих состояний.
         
         Args:
             histories: Список историй для каждого симулятора
+            prompt_type: Тип промпта ("standard", "reasoning")
             
         Returns:
             List[str]: Список промптов для всех симуляторов
@@ -125,14 +126,23 @@ class ParallelSimulator:
             if len(history) > 2:
                 history = history[-2:]
             
-            # Используем разные шаблоны в зависимости от наличия истории
-            if not history:
-                # Первый шаг эпизода
-                prompt = get_first_step_prompt(state_text, is_multi_well)
-            else:
-                # Последующие шаги с историей
-                history_text = ' | '.join(history)
-                prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
+            # Используем разные шаблоны в зависимости от наличия истории и типа промпта
+            if prompt_type == "reasoning":
+                if not history:
+                    # Первый шаг эпизода с рассуждениями
+                    prompt = get_reasoning_first_step_prompt(state_text, is_multi_well)
+                else:
+                    # Последующие шаги с историей и рассуждениями
+                    history_text = ' | '.join(history)
+                    prompt = get_reasoning_subsequent_step_prompt(state_text, history_text, is_multi_well)
+            else:  # standard
+                if not history:
+                    # Первый шаг эпизода
+                    prompt = get_first_step_prompt(state_text, is_multi_well)
+                else:
+                    # Последующие шаги с историей
+                    history_text = ' | '.join(history)
+                    prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
             
             prompts.append(prompt)
         
@@ -196,86 +206,226 @@ class ParallelSimulator:
     
     def parse_llm_action(self, response: str) -> Tuple[Optional[float], Dict[str, float]]:
         """
-        Extracts the action value from the LLM response.
+        Извлекает значение действия из ответа языковой модели.
         
         Args:
-            response (str): The LLM response text.
+            response (str): Текст ответа модели.
             
         Returns:
-            Tuple[Optional[float], Dict[str, float]]: A tuple containing the extracted action value (between 0 and 1 or None if format invalid)
-            and a dictionary of format rewards.
+            Tuple[Optional[float], Dict[str, float]]: Кортеж, содержащий извлеченное значение действия 
+            (от 0 до 1 или None если формат некорректен) и словарь наград за форматирование.
         """
         try:
-            # Clean up the response
+            # Очищаем ответ
             clean_response = response.strip()
             
-            # If response is empty, return None to indicate invalid format
+            # Если ответ пустой, возвращаем None для обозначения некорректного формата
             if not clean_response:
-                print(f"Пустой ответ: действие не будет выполнено")
+                print(f"{COLOR_RED}Пустой ответ: действие не будет выполнено{COLOR_RESET}")
                 return None, {"empty_response": -1.0}
             
-            # Проверяем правильный формат <parameter>число</parameter>
+            # Проверяем количество тегов <reasoning> и <parameter> в ответе
+            opening_reasoning_tags = clean_response.count('<reasoning>')
+            closing_reasoning_tags = clean_response.count('</reasoning>')
+            opening_parameter_tags = clean_response.count('<parameter>')
+            closing_parameter_tags = clean_response.count('</parameter>')
+            
+            # Если есть множественные теги, считаем формат некорректным
+            if opening_reasoning_tags > 1 or closing_reasoning_tags > 1:
+                print(f"{COLOR_RED}Неправильный формат ответа. Действие не будет выполнено.{COLOR_RESET}")
+                return None, {"multiple_reasoning_tags": -1.0}
+            
+            if opening_parameter_tags > 1 or closing_parameter_tags > 1:
+                print(f"{COLOR_RED}Неправильный формат ответа. Действие не будет выполнено.{COLOR_RESET}")
+                return None, {"multiple_parameter_tags": -1.0}
+            
+            # Проверяем наличие тега reasoning (необязательный)
+            has_reasoning = False
+            reasoning_content = ""
+            reasoning_pattern = r'<reasoning>(.*?)</reasoning>'
+            reasoning_match = re.search(reasoning_pattern, clean_response, re.DOTALL)
+            
+            # Расчет штрафа за длинные размышления
+            reasoning_length_penalty = 0.0
+            max_allowed_words = 50  # Максимально допустимое количество слов в рассуждении
+            
+            if reasoning_match:
+                reasoning_content = reasoning_match.group(1).strip()
+                if len(reasoning_content) > 5:  # Уменьшаем минимальную длину рассуждения
+                    has_reasoning = True
+                    
+                    # Подсчитываем количество слов в рассуждении
+                    word_count = len(reasoning_content.split())
+                    
+                    # Если слов больше максимально допустимого количества, добавляем штраф
+                    if word_count > max_allowed_words:
+                        # Штраф за каждые 10 слов сверх лимита
+                        excess_words = word_count - max_allowed_words
+                        reasoning_length_penalty = min(1.0, excess_words / 100)
+                        print(f"Слишком длинное рассуждение: {word_count} слов (лимит {max_allowed_words}). Штраф: {reasoning_length_penalty:.2f}")
+            
+            # Также проверяем наличие открывающего тега reasoning без закрывающего
+            # Но только если нет закрытого тега
+            if not has_reasoning and opening_reasoning_tags == 1 and closing_reasoning_tags == 0:
+                # Извлекаем содержимое после <reasoning>
+                reasoning_start = clean_response.find('<reasoning>') + len('<reasoning>')
+                reasoning_content = clean_response[reasoning_start:].strip()
+                if len(reasoning_content) > 5:
+                    has_reasoning = True
+                    
+                    # Подсчитываем количество слов в рассуждении
+                    word_count = len(reasoning_content.split())
+                    
+                    # Если слов больше максимально допустимого количества, добавляем штраф
+                    if word_count > max_allowed_words:
+                        # Штраф за каждые 10 слов сверх лимита
+                        excess_words = word_count - max_allowed_words
+                        reasoning_length_penalty = min(1.0, excess_words / 100)
+                        print(f"Слишком длинное незавершенное рассуждение: {word_count} слов (лимит {max_allowed_words}). Штраф: {reasoning_length_penalty:.2f}")
+                    
+                    # Удаляем неполный тег из ответа для дальнейшей обработки
+                    clean_response = clean_response.replace('<reasoning>', '').strip()
+            
+            # Проверка наличия parameter тега для извлечения действия
             perfect_pattern = r'<parameter>(.*?)</parameter>'
             perfect_match = re.search(perfect_pattern, clean_response, re.DOTALL)
             
             if perfect_match:
-                # Extract the value inside the tags
+                # Извлекаем значение внутри тегов
                 value_str = perfect_match.group(1).strip()
+                
+                # Проверяем, что в теге parameter содержится только число
+                if not re.match(r'^\s*\d+(\.\d+)?\s*$', value_str):
+                    print(f"{COLOR_YELLOW}Неполный формат тега parameter. Возможно действие не будет выполнено корректно.{COLOR_RESET}")
+                    # Попробуем извлечь число из строки
+                    numeric_pattern = r'(\d+(\.\d+)?)'
+                    numeric_match = re.search(numeric_pattern, value_str)
+                    if numeric_match:
+                        value_str = numeric_match.group(1)
+                        print(f"{COLOR_GREEN}Извлечено число: {value_str}{COLOR_RESET}")
+                    else:
+                        print(f"{COLOR_RED}Не найдено число в теге parameter. Действие не будет выполнено.{COLOR_RESET}")
+                        return None, {"parameter_not_number": -1.0}
+                
                 try:
                     value = float(value_str)
-                    # Limit the range
+                    
+                    # Ограничиваем диапазон значений
                     value = max(0.0, min(1.0, value))
-                    # Идеальный формат, максимальная награда
-                    return value, {"parameter_format": 1.0}
+                    if value < 0.0 or value > 1.0:
+                        print(f"Значение в теге <parameter> ({value}) выходит за допустимый диапазон [0, 1]. Применено ограничение: {value}")
+                    
+                    # Определяем тип награды за формат с учетом штрафа за длину рассуждения
+                    if has_reasoning:
+                        # Идеальный формат с рассуждением, максимальная награда за минусом штрафа за длину
+                        format_reward = 1.2 - reasoning_length_penalty
+                        return value, {"reasoning_parameter_format": format_reward}
+                    else:
+                        # Идеальный формат без рассуждения, хорошая награда
+                        return value, {"parameter_format": 1.0}
                 except ValueError:
-                    # If the content inside tags is not a number, use default and give negative reward
+                    # Если содержимое тегов не число, возвращаем None
                     print(f"Ошибка формата: тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
                     return None, {"parameter_not_number": -1.0}
             
-            # Более гибкий паттерн для случаев с незакрытыми тегами
-            flexible_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
-            flexible_match = re.search(flexible_pattern, clean_response, re.DOTALL)
+            # Более гибкий паттерн для случаев с незакрытыми тегами parameter
+            if opening_parameter_tags == 1 and closing_parameter_tags == 0:
+                flexible_parameter_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
+                flexible_parameter_match = re.search(flexible_parameter_pattern, clean_response, re.DOTALL)
+                
+                if flexible_parameter_match:
+                    # Extract the value inside the tags
+                    value_str = flexible_parameter_match.group(1).strip()
+                    
+                    # Проверяем, что в теге parameter содержится только число
+                    if not re.match(r'^\s*\d+(\.\d+)?\s*$', value_str):
+                        print(f"{COLOR_YELLOW}Неполный формат тега parameter. Возможно действие не будет выполнено корректно.{COLOR_RESET}")
+                        # Попробуем извлечь число из строки
+                        numeric_pattern = r'(\d+(\.\d+)?)'
+                        numeric_match = re.search(numeric_pattern, value_str)
+                        if numeric_match:
+                            value_str = numeric_match.group(1)
+                            print(f"{COLOR_GREEN}Извлечено число: {value_str}{COLOR_RESET}")
+                        else:
+                            print(f"{COLOR_RED}Не найдено число в теге parameter. Действие не будет выполнено.{COLOR_RESET}")
+                            return None, {"parameter_not_number": -1.0}
+                    
+                    try:
+                        value = float(value_str)
+                        # Ограничиваем диапазон
+                        value = max(0.0, min(1.0, value))
+                        
+                        # Определяем тип награды с учетом наличия рассуждения и штрафа за длину
+                        if has_reasoning:
+                            # Неполный формат с рассуждением, хорошая награда за минусом штрафа за длину
+                            format_reward = 0.8 - reasoning_length_penalty
+                            print(f"{COLOR_GREEN}Неполный формат с рассуждением. Действие будет выполнено.{COLOR_RESET}")
+                            return value, {"reasoning_almost_parameter_format": format_reward}
+                        else:
+                            # Неполный формат без рассуждения, умеренная награда
+                            print(f"{COLOR_YELLOW}Неполный формат без рассуждения. Действие будет выполнено.{COLOR_RESET}")
+                            return value, {"almost_parameter_format": 0.6}
+                    except ValueError:
+                        # If the content inside tags is not a number, use default and give negative reward
+                        print(f"{COLOR_RED}Ошибка формата: неполный тег parameter не содержит число. Действие не будет выполнено.{COLOR_RESET}")
+                        return None, {"parameter_not_number": -1.0}
             
-            if flexible_match:
-                # Extract the value inside the tags
-                value_str = flexible_match.group(1).strip()
-                try:
-                    value = float(value_str)
-                    # Limit the range
-                    value = max(0.0, min(1.0, value))
-                    # Почти правильный формат, положительная но не максимальная награда
-                    print(f"Неполный формат тегов: {clean_response}. Действие будет выполнено, но в следующий раз используйте корректный формат.")
-                    return value, {"almost_parameter_format": 0.6}
-                except ValueError:
-                    # If the content inside tags is not a number, use default and give negative reward
-                    print(f"Ошибка формата: неполный тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                    return None, {"parameter_not_number": -1.0}
+            # Вариант для случая с одним тегом <reasoning> без параметра - ищем число в тексте рассуждения
+            if has_reasoning:
+                # Ищем число в тексте рассуждения
+                number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
+                number_match = re.search(number_pattern, reasoning_content)
+                
+                if number_match:
+                    value_str = number_match.group(1).strip()
+                    try:
+                        value = float(value_str)
+                        value = max(0.0, min(1.0, value))
+                        # Штраф за отсутствие тега параметра плюс штраф за длину
+                        format_reward = -0.3 - reasoning_length_penalty
+                        print(f"{COLOR_YELLOW}Найдено число {value} в рассуждении. Действие будет выполнено.{COLOR_RESET}")
+                        return value, {"reasoning_without_parameter": format_reward}
+                    except ValueError:
+                        pass
+                
+                # Если в рассуждении нет числа, даем значение по умолчанию со штрафом и штрафом за длину
+                format_reward = -0.5 - reasoning_length_penalty
+                print(f"{COLOR_YELLOW}Рассуждение без числа. Используем значение по умолчанию.{COLOR_RESET}")
+                return 0.5, {"reasoning_no_parameter": format_reward}
             
-            # Ищем число в тексте для использования как значение (но даем отрицательную награду)
+            # Если у нас нет рассуждения, ищем число в тексте ответа
             number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
             number_match = re.search(number_pattern, clean_response)
+            
             if number_match:
-                print(f"Найдено число без правильного формата: {clean_response}. Действие не будет выполнено, используйте формат <parameter>число</parameter>.")
-                return None, {"wrong_format_with_number": -0.8}
+                value_str = number_match.group(1).strip()
+                try:
+                    value = float(value_str)
+                    value = max(0.0, min(1.0, value))
+                    print(f"{COLOR_GREEN}Найдено число: {value}. Действие будет выполнено.{COLOR_RESET}")
+                    return value, {"wrong_format_with_number": -0.8}
+                except ValueError:
+                    pass
             
             # Check for explicit cases of full opening/closing for value extraction
             if any(phrase in clean_response.lower() for phrase in ["fully open", "maximum open", "completely open", "полностью открыть"]):
-                print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>1.0</parameter>")
-                return None, {"wrong_format_open": -0.8}
+                print(f"{COLOR_YELLOW}Найдена фраза о полном открытии. Используем значение 1.0{COLOR_RESET}")
+                return 1.0, {"wrong_format_open": -0.8}
             elif any(phrase in clean_response.lower() for phrase in ["fully close", "completely close", "close the choke", "полностью закрыть"]):
-                print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.0</parameter>")
-                return None, {"wrong_format_close": -0.8}
+                print(f"{COLOR_YELLOW}Найдена фраза о полном закрытии. Используем значение 0.0{COLOR_RESET}")
+                return 0.0, {"wrong_format_close": -0.8}
             elif any(phrase in clean_response.lower() for phrase in ["no change", "maintain", "keep", "без изменений", "сохранить"]):
-                print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.5</parameter>")
-                return None, {"wrong_format_maintain": -0.8}
+                print(f"{COLOR_YELLOW}Найдена фраза о сохранении состояния. Используем значение 0.5{COLOR_RESET}")
+                return 0.5, {"wrong_format_maintain": -0.8}
             
-            # If unable to extract a value, use the default
-            print(f"Не удалось извлечь значение из ответа: '{clean_response}'. Действие не будет выполнено.")
-            return None, {"wrong_format_default": -1.0}
+            # Если не удалось извлечь значение, возвращаем случайное значение со штрафом
+            random_value = 0.5  # Среднее значение в качестве действия по умолчанию
+            print(f"{COLOR_RED}Не удалось извлечь значение из ответа. Используем значение по умолчанию.{COLOR_RESET}")
+            return random_value, {"wrong_format_default": -1.0}
         except Exception as e:
-            # In case of any error, return None to indicate invalid format
-            print(f"Ошибка при обработке ответа: {str(e)}. Действие не будет выполнено.")
-            return None, {"error": -1.0}
+            # В случае любой ошибки возвращаем None для обозначения некорректного формата
+            print(f"{COLOR_RED}Ошибка при обработке ответа: {str(e)}. Используем значение по умолчанию.{COLOR_RESET}")
+            return 0.5, {"error": -1.0}
 
 
 def parallel_rollout(
@@ -286,6 +436,7 @@ def parallel_rollout(
     temperature: float = 0.7,
     top_p: float = 0.95,
     verbose: bool = True,
+    prompt_type: str = "standard",
 ) -> Tuple[
     List[torch.Tensor],   # all_episode_tokens
     List[torch.Tensor],   # all_action_masks
@@ -293,90 +444,88 @@ def parallel_rollout(
     List[Dict]            # all_episode_stats
 ]:
     """
-    Выполняет параллельные роллауты для всех симуляторов.
+    Выполняет параллельный прогон эпизодов на множестве симуляторов.
     
     Args:
-        model: Языковая модель
-        tokenizer: Токенизатор
-        parallel_sim: Объект класса ParallelSimulator
-        n_steps: Максимальное количество шагов для каждого роллаута
-        temperature: Температура генерации
-        top_p: Параметр top_p для генерации
-        verbose: Выводить ли информацию в консоль
-    
+        model: Модель для генерации ответов
+        tokenizer: Токенизатор для модели
+        parallel_sim: Параллельный симулятор
+        n_steps: Максимальное количество шагов в эпизоде
+        temperature: Температура для семплирования
+        top_p: Параметр top_p для семплирования
+        verbose: Флаг для включения подробного вывода
+        prompt_type: Тип промпта для генерации ("standard", "reasoning")
+        
     Returns:
-        Кортеж из:
-            all_episode_tokens: Список тензоров с токенами для каждого эпизода
-            all_action_masks: Список тензоров с масками действий
-            all_rewards: Список тензоров с наградами
-            all_episode_stats: Список словарей со статистикой
+        Tuple: Кортеж из списков с токенами, масками действий, наградами и статистикой
     """
-    model.eval()  # Переводим модель в режим оценки
-    device = next(model.parameters()).device
+    # Засекаем время начала выполнения
+    start_time = time.time()
     
-    n_simulators = parallel_sim.n_simulators
-    
-    # Инициализируем хранилища для всех эпизодов
+    # Инициализируем списки для хранения результатов
     all_episode_tokens = []
     all_action_masks = []
     all_rewards = []
     all_episode_stats = []
     
-    # Инициализируем счетчики для отслеживания прогресса
-    steps_completed = [0] * n_simulators
+    # Сбрасываем состояние всех симуляторов
+    parallel_sim.reset_all()
+    
+    # Количество симуляторов
+    n_simulators = parallel_sim.n_simulators
+    
+    # Готовим данные для отслеживания прогресса эпизодов
     episodes_done = [False] * n_simulators
-    skipped_steps = [0] * n_simulators  # Счетчик пропущенных шагов для каждого симулятора
-    
-    # Истории для каждого симулятора
-    histories = [[] for _ in range(n_simulators)]
-    
-    # Данные эпизодов
+    episode_histories = [[] for _ in range(n_simulators)]
     episode_tokens_list = [[] for _ in range(n_simulators)]
     episode_action_masks_list = [[] for _ in range(n_simulators)]
     episode_rewards_list = [[] for _ in range(n_simulators)]
+    episode_format_rewards_list = [[] for _ in range(n_simulators)]
     episode_actions_list = [[] for _ in range(n_simulators)]
+    steps_completed = [0] * n_simulators
     episode_total_rewards = [0.0] * n_simulators
     episode_production = [0.0] * n_simulators
-    episode_format_rewards_list = [[] for _ in range(n_simulators)]  # Добавляем список для хранения формата наград
+    skipped_steps = [0] * n_simulators
     
-    start_time = time.time()
+    # Получаем все возможные индексы симуляторов
+    all_indices = list(range(n_simulators))
     
-    # Создаем конфигурацию генерации
-    generation_config = GenerationConfig(
-        max_new_tokens=10,  # Ограничиваем длину генерации для эффективности
-        do_sample=True,
-        temperature=temperature,
-        top_p=top_p,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    
-    # Выполняем шаги для всех симуляторов
+    # Основной цикл по шагам
     for step in range(n_steps):
         if verbose:
-            print(f"\n{COLOR_CYAN}Шаг {step+1}/{n_steps}{COLOR_RESET}")
+            print(f"\n{COLOR_CYAN}==== Шаг {step + 1} ===={COLOR_RESET}")
         
-        # Получаем список активных симуляторов (не завершенных)
+        # Фильтруем активные симуляторы (не завершенные)
         active_indices = [i for i, done in enumerate(episodes_done) if not done]
         
         if not active_indices:
             if verbose:
-                print(f"{COLOR_YELLOW}Все эпизоды завершены, останавливаем симуляцию{COLOR_RESET}")
+                print(f"{COLOR_YELLOW}Все эпизоды завершены!{COLOR_RESET}")
             break
         
-        # Получаем промпты только для активных симуляторов
-        active_histories = [histories[i] for i in active_indices]
-        prompts = parallel_sim.get_prompts(active_histories)
+        if verbose:
+            print(f"Активные симуляторы: {[i+1 for i in active_indices]}")
+        
+        # Получаем промпты для активных симуляторов
+        active_histories = [episode_histories[i] for i in active_indices]
+        prompts = parallel_sim.get_prompts(active_histories, prompt_type=prompt_type)
         
         # Токенизируем все промпты
-        tokenized_inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+        tokenized_inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(parallel_sim.device)
         
         # Генерируем действия параллельно
         with torch.no_grad():
             try:
                 outputs = model.generate(
                     **tokenized_inputs,
-                    generation_config=generation_config,
+                    generation_config=GenerationConfig(
+                        max_new_tokens=128,  # Увеличиваем длину генерации для более качественных ответов
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                    ),
                 )
             except Exception as e:
                 if verbose:
@@ -384,23 +533,36 @@ def parallel_rollout(
                 # Создаем запасной вариант выходов
                 outputs = torch.cat([
                     tokenized_inputs.input_ids,
-                    torch.ones((len(active_indices), 1), dtype=torch.long, device=device) * tokenizer.encode("0.5", add_special_tokens=False)[0]
+                    torch.ones((len(active_indices), 1), dtype=torch.long, device=parallel_sim.device) * tokenizer.encode("0.5", add_special_tokens=False)[0]
                 ], dim=1)
         
         # Извлекаем новые токены и действия
         actions = []
         valid_actions = []  # Список для хранения валидных действий
         valid_indices = []  # Список для хранения индексов валидных действий
+        
         for i, idx in enumerate(active_indices):
+            # Добавляем проверку на существование индексов
+            if i >= len(outputs) or idx >= n_simulators:
+                if verbose:
+                    print(f"{COLOR_RED}Ошибка индексации: i={i}, idx={idx}{COLOR_RESET}")
+                continue
+                
             # Получаем только новые токены (без промпта)
             # Batch size может быть > 1, поэтому берем соответствующую строку
-            new_tokens = outputs[i, tokenized_inputs.input_ids.shape[1]:]
+            input_length = tokenized_inputs.input_ids.shape[1]
+            if input_length < outputs.shape[1]:
+                new_tokens = outputs[i, input_length:]
+            else:
+                # В случае если по какой-то причине модель не сгенерировала новые токены
+                new_tokens = torch.tensor([tokenizer.encode("0.5", add_special_tokens=False)[0]], 
+                                       device=parallel_sim.device)
             
             # Декодируем ответ
             response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
             
             if verbose:
-                print(f"Симулятор {idx+1}: {COLOR_GREEN}Ответ модели:{COLOR_RESET} '{response}'")
+                print(f"Симулятор {idx+1}: Шаг {step+1}/{n_steps} {COLOR_GREEN}Ответ модели:{COLOR_RESET} '{response}'")
             
             # Очищаем ответ от символов, которые модель часто повторяет
             response = re.sub(r'(\*+)', '', response)  # Удаляем звездочки
@@ -410,53 +572,111 @@ def parallel_rollout(
             # Извлекаем действие из ответа
             action, format_rewards = parallel_sim.parse_llm_action(response)
             
+            # Убедимся, что format_rewards - словарь, даже если parse_llm_action вернул None
+            if format_rewards is None:
+                format_rewards = {"error": -1.0}
+                
+            # Инициализируем список действий, если он еще не существует
+            if len(episode_actions_list) <= idx:
+                # Если каким-то образом индекс оказался за пределами списка
+                episode_actions_list.extend([[] for _ in range(idx - len(episode_actions_list) + 1)])
+                
+            if len(episode_format_rewards_list) <= idx:
+                episode_format_rewards_list.extend([[] for _ in range(idx - len(episode_format_rewards_list) + 1)])
+            
+            # Проверяем, не является ли это первым шагом с неправильным форматом
+            if step == 0 and action is None:
+                # На первом шаге формат неправильный, прерываем эпизод
+                episodes_done[idx] = True
+                
+                # Добавляем отрицательную награду за неправильный формат
+                format_reward = sum(format_rewards.values())
+                
+                # Инициализируем список наград, если он еще не существует
+                if len(episode_rewards_list) <= idx:
+                    episode_rewards_list.extend([[] for _ in range(idx - len(episode_rewards_list) + 1)])
+                
+                episode_rewards_list[idx].append(format_reward)
+                episode_total_rewards[idx] += format_reward
+                
+                # Увеличиваем счетчик шагов, так как это тоже шаг обучения
+                steps_completed[idx] += 1
+                
+                if verbose:
+                    print(f"{COLOR_RED}Симулятор {idx+1}: Шаг {step+1}/{n_steps} Эпизод прерван из-за неправильного формата на первом шаге.{COLOR_RESET}")
+                    print(f"{COLOR_RED}Симулятор {idx+1}: Шаг {step+1}/{n_steps} Штраф за формат: {format_reward:.4f}{COLOR_RESET}")
+                
+                # Сохраняем токены для обучения
+                episode_tokens_list[idx].append(new_tokens)
+                
+                # Создаем маску действий
+                action_mask = torch.ones_like(new_tokens, dtype=torch.bool)
+                episode_action_masks_list[idx].append(action_mask)
+                
+                # Заполняем дефолтное значение для действия
+                actions.append(0.0)
+                episode_actions_list[idx].append(0.0)
+                episode_format_rewards_list[idx].append(format_rewards)
+                
+                # Пропускаем дальнейшую обработку для этого симулятора
+                continue
+            
             if action is not None:
                 if verbose:
-                    print(f"Симулятор {idx+1}: {COLOR_YELLOW}Действие:{COLOR_RESET} {action:.4f}")
-                    print(f"Симулятор {idx+1}: {COLOR_BLUE}Награды за форматирование:{COLOR_RESET} {format_rewards}")
+                    print(f"Симулятор {idx+1}: Шаг {step+1}/{n_steps} {COLOR_YELLOW}Действие:{COLOR_RESET} {action:.4f}")
+                    print(f"Симулятор {idx+1}: Шаг {step+1}/{n_steps} {COLOR_BLUE}Награды за форматирование:{COLOR_RESET} {format_rewards}")
                 
                 # Сохраняем действие и индекс
                 valid_actions.append(action)
                 valid_indices.append(i)
-                skipped_steps[idx] = 0  # Сбрасываем счетчик пропущенных шагов
+                
+                # Сохраняем токены действия в любом случае (для обучения)
+                action_tokens = new_tokens
+                
+                # Убеждаемся, что тензор не пустой
+                if action_tokens.numel() == 0:
+                    action_tokens = torch.tensor([tokenizer.encode("0", add_special_tokens=False)[0]], 
+                                              device=parallel_sim.device)
+                
+                # Инициализируем списки токенов и масок, если они еще не существуют
+                if len(episode_tokens_list) <= idx:
+                    episode_tokens_list.extend([[] for _ in range(idx - len(episode_tokens_list) + 1)])
+                    
+                if len(episode_action_masks_list) <= idx:
+                    episode_action_masks_list.extend([[] for _ in range(idx - len(episode_action_masks_list) + 1)])
+                    
+                episode_tokens_list[idx].append(action_tokens)
+                
+                # Создаем маску действий - улучшенная версия
+                # Маскируем все токены ответа, независимо от того, валидный формат или нет
+                action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
+                episode_action_masks_list[idx].append(action_mask)
+                
+                # Добавляем информацию в историю только если действие было валидным
+                if idx < len(parallel_sim.current_states):
+                    current_state = parallel_sim.current_states[idx]
+                    episode_histories[idx].append(f"Сост:{parallel_sim.format_short_state(current_state)}, Д:{action:.2f}")
+                else:
+                    if verbose:
+                        print(f"{COLOR_RED}Ошибка: Индекс {idx} вне диапазона current_states{COLOR_RESET}")
             else:
                 if verbose:
-                    print(f"Симулятор {idx+1}: {COLOR_RED}Действие пропущено из-за неправильного формата{COLOR_RESET}")
-                    print(f"Симулятор {idx+1}: {COLOR_BLUE}Штраф за форматирование:{COLOR_RESET} {format_rewards}")
-                
-                # Отмечаем шаг как пропущенный и увеличиваем счетчик
+                    print(f"Симулятор {idx+1}: Шаг {step+1}/{n_steps} {COLOR_RED}Действие пропущено из-за неправильного формата{COLOR_RESET}")
+                    print(f"Симулятор {idx+1}: Шаг {step+1}/{n_steps} {COLOR_BLUE}Штраф за форматирование:{COLOR_RESET} {format_rewards}")
+                # Увеличиваем счетчик пропущенных шагов
                 skipped_steps[idx] += 1
                 
-                # Если слишком много пропущенных шагов подряд, завершаем эпизод
-                if skipped_steps[idx] > 5:
-                    if verbose:
-                        print(f"{COLOR_RED}Симулятор {idx+1}: Слишком много пропущенных шагов подряд, завершаем эпизод.{COLOR_RESET}")
-                    episodes_done[idx] = True
+                # Прерываем эпизод при неправильном формате на любом шаге
+                episodes_done[idx] = True
+                
+                if verbose:
+                    print(f"{COLOR_RED}Симулятор {idx+1}: Шаг {step+1}/{n_steps} Эпизод прерван из-за неправильного формата ответа.{COLOR_RESET}")
             
             # Заполняем пустым значением (будет игнорироваться, если шаг пропущен)
-            actions.append(action if action is not None else 0.0)
-            episode_actions_list[idx].append(action if action is not None else 0.0)
+            default_action = 0.0
+            actions.append(action if action is not None else default_action)
+            episode_actions_list[idx].append(action if action is not None else default_action)
             episode_format_rewards_list[idx].append(format_rewards)  # Сохраняем формат наград
-            
-            # Сохраняем токены действия в любом случае (для обучения)
-            action_tokens = new_tokens
-            
-            # Убеждаемся, что тензор не пустой
-            if action_tokens.numel() == 0:
-                action_tokens = torch.tensor([tokenizer.encode("0", add_special_tokens=False)[0]], 
-                                          device=device)
-            
-            episode_tokens_list[idx].append(action_tokens)
-            
-            # Создаем маску действий - улучшенная версия
-            # Маскируем все токены ответа, независимо от того, валидный формат или нет
-            action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
-            episode_action_masks_list[idx].append(action_mask)
-            
-            # Добавляем информацию в историю только если действие было валидным
-            if action is not None:
-                current_state = parallel_sim.current_states[idx]
-                histories[idx].append(f"Сост:{parallel_sim.format_short_state(current_state)}, Д:{action:.2f}")
         
         # Если есть валидные действия, выполняем шаг для соответствующих симуляторов
         if valid_actions:
@@ -477,18 +697,28 @@ def parallel_rollout(
                 if episodes_done[idx] or idx not in [active_indices[i] for i in valid_indices]:
                     continue
                 
+                # Инициализируем списки, если они еще не существуют для этого индекса
+                if len(episode_rewards_list) <= idx:
+                    episode_rewards_list.extend([[] for _ in range(idx - len(episode_rewards_list) + 1)])
+                
+                # Проверяем, есть ли формат наград для этого шага
+                format_reward = 0.0
+                if idx < len(episode_format_rewards_list) and len(episode_format_rewards_list[idx]) > 0:
+                    format_reward = sum(episode_format_rewards_list[idx][-1].values())
+                
                 # Обновляем данные для активного симулятора
-                episode_rewards_list[idx].append(reward + sum(episode_format_rewards_list[idx][-1].values()))
-                full_reward = reward + sum(episode_format_rewards_list[idx][-1].values())
+                episode_rewards_list[idx].append(reward + format_reward)
+                full_reward = reward + format_reward
                 episode_total_rewards[idx] += full_reward
                 steps_completed[idx] += 1
                 
                 # Обновляем информацию о добыче
-                if hasattr(parallel_sim.simulators[idx], 'cumulative_production'):
+                if idx < len(parallel_sim.simulators) and hasattr(parallel_sim.simulators[idx], 'cumulative_production'):
                     episode_production[idx] = parallel_sim.simulators[idx].cumulative_production
                 
                 if verbose:
-                    print(f"Симулятор {idx+1}: Шаг {steps_completed[idx]}, Награда: {reward:.4f}, "
+                    print(f"Симулятор {idx+1}: Шаг {steps_completed[idx]}/{n_steps}, Награда: {reward:.4f}, "
+                        f"Формат: {format_reward:.4f}, "
                         f"Общая награда: {episode_total_rewards[idx]:.4f}, "
                         f"Добыча: {episode_production[idx]:.2f} м³")
                 
@@ -501,28 +731,42 @@ def parallel_rollout(
         else:
             # Если нет валидных действий, добавляем штрафы за формат для всех активных симуляторов
             for i, idx in enumerate(active_indices):
-                format_reward = sum(episode_format_rewards_list[idx][-1].values())
+                # Проверяем, есть ли формат наград для этого шага
+                format_reward = 0.0
+                if idx < len(episode_format_rewards_list) and len(episode_format_rewards_list[idx]) > 0:
+                    format_reward = sum(episode_format_rewards_list[idx][-1].values())
+                
+                # Инициализируем список, если он еще не существует для этого индекса
+                if len(episode_rewards_list) <= idx:
+                    episode_rewards_list.extend([[] for _ in range(idx - len(episode_rewards_list) + 1)])
+                
                 episode_rewards_list[idx].append(format_reward)
                 episode_total_rewards[idx] += format_reward
                 
                 if verbose:
-                    print(f"Симулятор {idx+1}: Шаг пропущен, Штраф за формат: {format_reward:.4f}, "
+                    print(f"Симулятор {idx+1}: Шаг {step+1}/{n_steps}, Штраф за формат: {format_reward:.4f}, "
                         f"Общая награда: {episode_total_rewards[idx]:.4f}")
+                
+                # Помечаем эпизод как завершенный из-за ошибки формата
+                episodes_done[idx] = True
+                
+                if verbose:
+                    print(f"{COLOR_RED}Симулятор {idx+1}: Шаг {step+1}/{n_steps} Эпизод прерван из-за неправильного формата ответа.{COLOR_RESET}")
     
     # После завершения всех шагов собираем финальные данные
     for idx in range(n_simulators):
         try:
-            # Пропускаем симуляторы, которые не начали работу
-            if steps_completed[idx] == 0:
-                continue
-                
+            # Даже прерванные эпизоды на первом шаге должны быть включены в обучение
+            # для передачи негативного сигнала
+            
             # Собираем токены для эпизода
             all_tokens = []
             all_masks = []
             
-            for step_tokens, step_masks in zip(episode_tokens_list[idx], episode_action_masks_list[idx]):
-                all_tokens.append(step_tokens)
-                all_masks.append(step_masks)
+            if idx < len(episode_tokens_list) and idx < len(episode_action_masks_list):
+                for step_tokens, step_masks in zip(episode_tokens_list[idx], episode_action_masks_list[idx]):
+                    all_tokens.append(step_tokens)
+                    all_masks.append(step_masks)
             
             # Проверяем, есть ли хоть какие-то токены
             if not all_tokens:
@@ -542,21 +786,47 @@ def parallel_rollout(
             all_episode_tokens.append(episode_tokens)
             all_action_masks.append(episode_masks)
             
-            # Преобразуем награды в тензор
-            episode_rewards = torch.tensor(episode_rewards_list[idx], device=device)
-            all_rewards.append(episode_rewards)
-            
-            # Собираем статистику эпизода
-            episode_stats = {
-                "steps": steps_completed[idx],
-                "reward": episode_total_rewards[idx],
-                "production": episode_production[idx],
-                "time": time.time() - start_time,
-                "actions": episode_actions_list[idx],
-                "format_rewards": episode_format_rewards_list[idx],
-                "skipped_steps": skipped_steps[idx]
-            }
-            all_episode_stats.append(episode_stats)
+            # Преобразуем награды в тензор, проверяя, что список существует
+            if idx < len(episode_rewards_list) and episode_rewards_list[idx]:
+                episode_rewards = torch.tensor(episode_rewards_list[idx], device=parallel_sim.device)
+                all_rewards.append(episode_rewards)
+                
+                # Собираем статистику эпизода с проверками на существование списков
+                episode_stats = {
+                    "steps": steps_completed[idx],
+                    "reward": episode_total_rewards[idx],
+                    "production": episode_production[idx] if idx < len(episode_production) else 0.0,
+                    "time": time.time() - start_time,
+                    "actions": episode_actions_list[idx] if idx < len(episode_actions_list) else [],
+                    "format_rewards": episode_format_rewards_list[idx] if idx < len(episode_format_rewards_list) else [],
+                    "skipped_steps": skipped_steps[idx] if idx < len(skipped_steps) else 0,
+                    "early_termination": True if skipped_steps[idx] > 0 else False,
+                    "first_step_error": step == 0 and action is None if idx < len(episode_actions_list) else False
+                }
+                all_episode_stats.append(episode_stats)
+            else:
+                # Если список наград пуст, создаем искусственный список с одной отрицательной наградой
+                # Это гарантирует, что даже эпизоды с ошибкой формата на первом шаге будут включены
+                if verbose:
+                    print(f"{COLOR_YELLOW}Симулятор {idx+1}: Создаем искусственную награду для обучения для эпизода с ошибкой.{COLOR_RESET}")
+                
+                # Создаем тензор с одной отрицательной наградой
+                episode_rewards = torch.tensor([-1.0], device=parallel_sim.device)
+                all_rewards.append(episode_rewards)
+                
+                # Создаем минимальную статистику для этого эпизода
+                episode_stats = {
+                    "steps": 1,  # Хотя бы один шаг
+                    "reward": -1.0,  # Отрицательная награда
+                    "production": 0.0,
+                    "time": time.time() - start_time,
+                    "actions": [0.0],  # Дефолтное действие
+                    "format_rewards": [{"wrong_format": -1.0}],  # Штраф за формат
+                    "skipped_steps": 1,
+                    "early_termination": True,
+                    "first_step_error": True
+                }
+                all_episode_stats.append(episode_stats)
             
         except Exception as e:
             if verbose:

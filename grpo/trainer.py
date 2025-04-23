@@ -41,7 +41,7 @@ import pickle
 from tqdm import tqdm
 
 from simulators.multi_well.simulator import MultiWellSimulator
-from grpo.prompts import get_single_well_prompt, get_subsequent_step_prompt, get_first_step_prompt, BASE_PROMPT_TEMPLATE
+from grpo.prompts import get_single_well_prompt, get_subsequent_step_prompt, get_first_step_prompt, BASE_PROMPT_TEMPLATE, get_reasoning_first_step_prompt, get_reasoning_subsequent_step_prompt
 
 # --- Добавляем константы для цветов ---
 COLOR_RESET = "\033[0m"
@@ -697,77 +697,122 @@ def sequences_log_probs(
     return log_probs
 
 
-def parse_args():
-    # Определяем имя скрипта для логгера
-    script_name = Path(__file__).stem # Получаем имя файла без .py
-    parser = argparse.ArgumentParser(description='Train a model with GRPO for oil well simulation.') # Обновляем описание
-
-    # Аргументы Логирования и Конфигурации
-    parser.add_argument('--run_name', type=str, default=None, help='Custom run name for logging (overrides auto-generated)')
-    parser.add_argument('--log_dir', type=str, default="logs", help='Root directory for logs')
-    parser.add_argument('--wandb', action='store_true', help='Use WandB for logging')
-    parser.add_argument('--wandb_project', type=str, default="grpo-oil-sim", help='WandB project name') # Обновляем проект по умолчанию
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--device_index', type=int, default=0, help='CUDA device index')
-
-    # Аргументы Модели
-    parser.add_argument('--model_name', type=str, default="Qwen/Qwen2.5-3B-Instruct", help='Model name or path')
-    parser.add_argument('--checkpoint_path', type=str, default="./checkpoints_oil_sim", help='Path to save checkpoints') # Обновляем путь по умолчанию
-    parser.add_argument('--checkpoint_interval', type=int, default=100, help='Save checkpoint every N global steps') # Интервал в шагах
-
-    # Аргументы Обучения
-    parser.add_argument('--total_steps', type=int, default=1000, help='Total number of optimization steps')
-    parser.add_argument('--epochs_per_step', type=int, default=1, help='Number of optimization epochs per collected batch')
-    parser.add_argument('--rollouts_per_step', type=int, default=32, help='Number of simulation episodes per global step') # Число эпизодов
-    parser.add_argument('--train_batch_size', type=int, default=8, help='Batch size for training phase (experience buffer)') # Размер батча для SGD
-    parser.add_argument('--max_buffer_size', type=int, default=0, help='Maximum replay buffer size (0 for unlimited)')
-    parser.add_argument('--lr', type=float, default=1e-6, help='Learning rate')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Gradient clipping norm')
-
-    # Аргументы GRPO/PPO
-    parser.add_argument('--gamma', type=float, default=0.97, help='Discount factor for returns')
-    parser.add_argument('--kl_weight', type=float, default=0.02, help='Weight for KL penalty in GRPOLoss')
-    parser.add_argument('--clip_eps', type=float, default=0.2, help='Clipping epsilon for PPO ratio in GRPOLoss')
-
-    # Аргументы Генерации/Симуляции
-    parser.add_argument('--max_length', type=int, default=1024, help='Max sequence length (prompt+responses) in Experience')
-    parser.add_argument('--max_new_tokens_per_step', type=int, default=10, help='Max new tokens per simulation step (LLM action)')
-    parser.add_argument('--temperature', type=float, default=0.7, help='Generation temperature')
-    parser.add_argument('--top_p', type=float, default=1.0, help='Generation top_p')
-
-    # Аргументы Симулятора - общие
-    parser.add_argument('--multi_well', action='store_true', help='Use multi-well simulator instead of single well')
+def parse_args(args=None):
+    """
+    Парсинг аргументов командной строки.
+    Args:
+        args: список аргументов для парсинга (если None, то используются sys.argv)
+    """
+    parser = argparse.ArgumentParser(description="Параметры обучения нейронной сети")
     
-    # Аргументы Симулятора - одиночной скважины
-    parser.add_argument('--initial_pressure', type=float, default=200.0, help='Initial reservoir pressure (atm)')
-    parser.add_argument('--initial_bhp', type=float, default=50.0, help='Initial bottom hole pressure (atm)')
-    parser.add_argument('--productivity_index', type=float, default=0.1, help='Productivity index (m3/day/atm)')
-    parser.add_argument('--total_volume', type=float, default=1e6, help='Total reservoir volume (m3)')
-    parser.add_argument('--simulation_dt', type=float, default=1.0, help='Simulation step size (days)')
-    parser.add_argument('--simulation_max_time', type=float, default=365.0, help='Maximum simulation time (days)')
+    # Основные параметры
+    parser.add_argument("--model_name", type=str, default="huggyllama/llama-7b",
+                        help="Имя или путь к модели для загрузки")
+    parser.add_argument("--checkpoint_path", type=str, default="./checkpoints",
+                        help="Путь для сохранения контрольных точек модели")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed для воспроизводимости результатов")
     
-    # Параметр, определяющий прогноз на N дней вперед
-    parser.add_argument('--forecast_days', type=int, default=1, 
-                      help='Number of days to forecast in each step (1=daily, 7=weekly, 30=monthly)')
+    # Параметр device_index
+    parser.add_argument("--device_index", type=int, default=0,
+                        help="Индекс устройства CUDA для запуска модели")
     
-    # Аргументы Симулятора - нескольких скважин
-    parser.add_argument('--n_wells', type=int, default=3, help='Number of wells in multi-well simulator')
-    parser.add_argument('--interaction_strength', type=float, default=0.1, help='Strength of interaction between wells (0-1)')
-    parser.add_argument('--shared_reservoir', action='store_true', help='Use shared reservoir in multi-well simulator')
-
-    parser.add_argument('--log_completions_interval', type=int, default=10, help='Log example episode rollout every N global steps')
-
-    args = parser.parse_args()
-
-    # Добавляем имя скрипта для логгера
-    args.script_name = script_name
-
-    # Создаем имя запуска по умолчанию, если не задано
-    if args.run_name is None:
-        # Используем дефисы в именах аргументов для авто-имени
-        args.run_name = f"{args.script_name}_lr{args.lr}_kl{args.kl_weight}_rp{args.rollouts_per_step}_bs{args.train_batch_size}"
-
-    return args
+    # Параметры для логов и отслеживания
+    parser.add_argument("--wandb", action="store_true", default=False,
+                        help="Использовать Weights & Biases для логирования")
+    parser.add_argument("--wandb_project", type=str, default="oil_sim",
+                        help="Имя проекта в Weights & Biases")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Имя пользователя или организации в Weights & Biases")
+    
+    # Параметры для директории логов
+    parser.add_argument("--log_dir", type=str, default="logs",
+                        help="Директория для хранения логов")
+    
+    # Параметр для имени запуска
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Имя запуска (по умолчанию генерируется автоматически)")
+    
+    # Параметр для имени скрипта
+    parser.add_argument("--script_name", type=str, default="train",
+                        help="Имя скрипта для логирования")
+    
+    # Параметры модели и токенизатора
+    parser.add_argument("--model_max_length", type=int, default=2048,
+                        help="Максимальная длина входной последовательности модели")
+    parser.add_argument("--use_4bit", action="store_true", default=False,
+                        help="Использовать 4-битное квантование для модели")
+    
+    # Параметры обучения
+    parser.add_argument("--lr", type=float, default=1e-5,
+                        help="Скорость обучения")
+    parser.add_argument("--train_batch_size", type=int, default=8,
+                        help="Размер батча для обучения")
+    parser.add_argument("--epochs_per_step", type=int, default=4,
+                        help="Количество эпох на каждом шаге обучения")
+    parser.add_argument("--total_steps", type=int, default=1000,
+                        help="Общее количество шагов обучения")
+    parser.add_argument("--checkpoint_interval", type=int, default=100,
+                        help="Интервал сохранения контрольных точек модели")
+    
+    # Параметры симуляции
+    parser.add_argument("--rollouts_per_step", type=int, default=50,
+                        help="Количество роллаутов, выполняемых через каждые N шагов")
+    parser.add_argument("--max_new_tokens_per_step", type=int, default=20,
+                        help="Максимальное количество токенов, генерируемых на каждом шаге")
+    parser.add_argument("--max_length", type=int, default=512,
+                        help="Максимальная длина последовательности для генерации")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Температура для сэмплирования при генерации")
+    parser.add_argument("--top_p", type=float, default=0.95,
+                        help="Top-p для сэмплирования при генерации")
+    parser.add_argument("--prompt_type", type=str, default="standard", choices=["standard", "reasoning"],
+                        help="Тип промпта: стандартный или с обоснованием")
+    
+    # Параметры для симулятора скважины
+    parser.add_argument("--multi_well", action="store_true", default=False,
+                        help="Использовать многоскважинный симулятор вместо одиночной скважины")
+    parser.add_argument("--n_wells", type=int, default=2,
+                        help="Количество скважин для многоскважинного симулятора")
+    parser.add_argument("--interaction_strength", type=float, default=0.2,
+                        help="Сила взаимодействия между скважинами")
+    parser.add_argument("--shared_reservoir", action="store_true", default=False,
+                        help="Использовать общий резервуар для всех скважин")
+    
+    # Физические параметры симулятора
+    parser.add_argument("--initial_pressure", type=float, default=200.0,
+                        help="Начальное пластовое давление (бар)")
+    parser.add_argument("--initial_bhp", type=float, default=50.0,
+                        help="Начальное забойное давление (бар)")
+    parser.add_argument("--productivity_index", type=float, default=0.1,
+                        help="Индекс продуктивности скважины (м³/день/бар)")
+    parser.add_argument("--total_volume", type=float, default=1000.0,
+                        help="Общий объем резервуара (м³)")
+    parser.add_argument("--simulation_dt", type=float, default=1.0,
+                        help="Шаг по времени для симуляции (дни)")
+    parser.add_argument("--simulation_max_time", type=float, default=20.0,
+                        help="Максимальное время симуляции (дни)")
+    
+    # Параметр для прогноза
+    parser.add_argument("--forecast_days", type=float, default=1.0,
+                        help="Количество дней для прогноза на один шаг симуляции")
+    
+    # Параметры для GRPO
+    parser.add_argument("--kl_weight", type=float, default=0.01,
+                        help="Вес для KL дивергенции в функции потерь")
+    parser.add_argument("--clip_eps", type=float, default=0.2,
+                        help="Эпсилон для отсечения в GRPO")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Коэффициент дисконтирования для расчета возвратов")
+                        
+    # Параметр для вывода промежуточных результатов
+    parser.add_argument("--verbose", action="store_true", default=False,
+                        help="Выводить подробную информацию при выполнении")
+    parser.add_argument("--log_completions_interval", type=int, default=0,
+                        help="Интервал логирования генерации (в шагах, 0 - отключено)")
+    
+    # Парсим аргументы
+    return parser.parse_args(args)
 
 ###############################################################################
 # БЛОК ФУНКЦИЙ ДЛЯ РАБОТЫ С СИМУЛЯТОРОМ
@@ -783,6 +828,7 @@ def rollout_simulator(
     do_sample: bool = True,
     seed: Optional[int] = None,
     verbose: bool = False,
+    prompt_type: str = "standard",
 ) -> Tuple[
     torch.Tensor,  # episode_tokens,
     torch.Tensor,  # action_masks
@@ -802,6 +848,7 @@ def rollout_simulator(
         do_sample: Выполнять ли семплирование при генерации
         seed: Случайное зерно для воспроизводимости
         verbose: Выводить ли информацию в процессе выполнения
+        prompt_type: Тип промпта ("standard" или "reasoning")
         
     Returns:
         Кортеж из:
@@ -843,14 +890,23 @@ def rollout_simulator(
         # Форматируем состояние
         state_text = format_state(state, simulator)
         
-        # Получаем промпт на основе текущего состояния и истории
-        if not history:
-            # Первый шаг эпизода
-            prompt = get_first_step_prompt(state_text, is_multi_well)
-        else:
-            # Последующие шаги с историей
-            history_text = ' | '.join(history[-2:])  # Ограничиваем 2 последними шагами
-            prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
+        # Получаем промпт на основе текущего состояния и истории в зависимости от типа промпта
+        if prompt_type == "reasoning":
+            if not history:
+                # Первый шаг эпизода с рассуждениями
+                prompt = get_reasoning_first_step_prompt(state_text, is_multi_well)
+            else:
+                # Последующие шаги с историей и рассуждениями
+                history_text = ' | '.join(history[-2:])  # Ограничиваем 2 последними шагами
+                prompt = get_reasoning_subsequent_step_prompt(state_text, history_text, is_multi_well)
+        else:  # standard
+            if not history:
+                # Первый шаг эпизода
+                prompt = get_first_step_prompt(state_text, is_multi_well)
+            else:
+                # Последующие шаги с историей
+                history_text = ' | '.join(history[-2:])  # Ограничиваем 2 последними шагами
+                prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
         
         if verbose:
             print(f"\nШаг {step+1}/{max_steps}")
@@ -1158,8 +1214,9 @@ def calculate_discounted_returns(rewards, gamma=0.99):
     
     return returns
 
-def main():
-    args = parse_args()
+def main(args=None):
+    if args is None:
+        args = parse_args()
 
     # --- Инициализация ---
     seed = args.seed
@@ -1177,6 +1234,22 @@ def main():
     log_completions_interval = args.log_completions_interval
     total_steps = args.total_steps
     epochs_per_step = args.epochs_per_step
+    verbose = args.verbose  # Добавляем переменную verbose из аргументов
+
+    # Выводим ключевые параметры для отладки
+    print(f"=== Параметры запуска ===")
+    print(f"Модель: {model_name}")
+    print(f"Максимальное время симуляции: {args.simulation_max_time} дней")
+    print(f"Количество шагов: {args.rollouts_per_step}")
+    print(f"Размер батча: {train_batch_size}")
+    print(f"Скорость обучения: {lr}")
+    print(f"Температура: {temperature}")
+    print(f"Top-p: {top_p}")
+    print(f"Тип симулятора: {'многоскважинный' if args.multi_well else 'односкважинный'}")
+    if args.multi_well:
+        print(f"Количество скважин: {args.n_wells}")
+    print(f"Прогноз дней на шаг: {args.forecast_days}")
+    print(f"=======================")
 
     use_4bit = True
     use_lora = True
@@ -1264,7 +1337,7 @@ def main():
         )
     
     print(f"Симулятор создан: {simulator.__class__.__name__}")
-    print(f"Период прогнозирования: {args.forecast_days} дней (dt = {simulator.dt:.1f})")
+    print(f"Период прогнозирования: {args.simulation_max_time} дней (dt = {simulator.dt:.1f})")
     
     # Создаем ReplayBuffer для хранения опыта
     replay_buffer = ReplayBuffer()
@@ -1315,9 +1388,11 @@ def main():
             model=model,
             tokenizer=tokenizer,
             parallel_sim=parallel_sim,
-            n_steps=int(args.simulation_max_time / args.simulation_dt),  # Максимальное количество шагов
+            n_steps=int(args.simulation_max_time),  # Количество шагов равно количеству дней симуляции
             temperature=temperature,
-            verbose=True
+            top_p=top_p,
+            verbose=verbose,
+            prompt_type=args.prompt_type  # Используем тип промпта из аргументов
         )
         
         # Обрабатываем результаты и создаем буфер опыта
@@ -1404,22 +1479,87 @@ def main():
         
         # Проверяем, что были собраны эпизоды
         # Преобразуем списки в тензоры
-        if "logits" not in model_batch_data or not model_batch_data["logits"]:
-            print(f"{COLOR_RED}Не удалось собрать ни одного эпизода. Пропускаем шаг обучения.{COLOR_RESET}")
-            # Увеличиваем счетчик глобальных шагов и продолжаем
-            global_step += 1
-            continue
-
+        if not episode_tokens or len(episode_tokens) == 0:
             print(f"{COLOR_RED}Не удалось собрать ни одного эпизода. Пропускаем шаг обучения.{COLOR_RESET}")
             # Увеличиваем счетчик глобальных шагов и продолжаем
             global_step += 1
             continue
         
-        # Преобразуем списки в тензоры
-        model_batch_data["logits"] = torch.stack(model_batch_data["logits"])
-        model_batch_data["sequences"] = torch.stack(model_batch_data["sequences"])
-        model_batch_data["action_masks"] = torch.stack(model_batch_data["action_masks"])
-        ref_batch_data["logits"] = torch.stack(ref_batch_data["logits"])
+        # Даже если все эпизоды завершились из-за неправильного формата, мы все равно 
+        # должны учиться на них (в батче будут только негативные примеры)
+        if "logits" not in model_batch_data or not model_batch_data["logits"]:
+            print(f"{COLOR_YELLOW}Все эпизоды завершились с ошибками формата. Продолжаем обучение на негативных примерах.{COLOR_RESET}")
+        
+        # Проверяем наличие тензоров с разными размерами и применяем паддинг вместо stack
+        print(f"  Подготовка данных для обучения...")
+        try:
+            # Используем pad_sequence вместо stack для тензоров, которые могут быть разной длины
+            from torch.nn.utils.rnn import pad_sequence
+            
+            # Для логитов нужно обрабатывать особым образом из-за их 3D формы
+            # Сначала проверим размеры всех логитов
+            logits_shapes = [logit.shape for logit in model_batch_data["logits"]]
+            print(f"  Размеры логитов: {logits_shapes}")
+            
+            # Проверяем, все ли размеры последней размерности совпадают (размер словаря)
+            vocab_sizes = [shape[-1] for shape in logits_shapes]
+            if len(set(vocab_sizes)) > 1:
+                raise ValueError(f"Размеры словаря логитов не совпадают: {vocab_sizes}")
+            
+            # Преобразуем 3D логиты в более удобный формат для паддинга
+            # Делаем паддинг по второй размерности (длина последовательности)
+            padded_logits = []
+            max_seq_len = max(logit.shape[0] for logit in model_batch_data["logits"])
+            vocab_size = vocab_sizes[0]
+            
+            for logit in model_batch_data["logits"]:
+                # Если нужен паддинг
+                if logit.shape[0] < max_seq_len:
+                    # Создаем тензор с нулями правильного размера
+                    padded = torch.zeros((max_seq_len, vocab_size), 
+                                        dtype=logit.dtype, 
+                                        device=logit.device)
+                    # Копируем данные из оригинального логита
+                    padded[:logit.shape[0], :] = logit
+                    padded_logits.append(padded)
+                else:
+                    padded_logits.append(logit)
+            
+            # Теперь все логиты имеют одинаковый размер, и мы можем использовать stack
+            model_batch_data["logits"] = torch.stack(padded_logits)
+            
+            # То же самое для логитов референсной модели
+            padded_ref_logits = []
+            max_seq_len = max(logit.shape[0] for logit in ref_batch_data["logits"])
+            
+            for logit in ref_batch_data["logits"]:
+                if logit.shape[0] < max_seq_len:
+                    padded = torch.zeros((max_seq_len, vocab_size), 
+                                        dtype=logit.dtype, 
+                                        device=logit.device)
+                    padded[:logit.shape[0], :] = logit
+                    padded_ref_logits.append(padded)
+                else:
+                    padded_ref_logits.append(logit)
+            
+            ref_batch_data["logits"] = torch.stack(padded_ref_logits)
+            
+            # Используем pad_sequence для последовательностей и масок
+            model_batch_data["sequences"] = pad_sequence(model_batch_data["sequences"], 
+                                                      batch_first=True, 
+                                                      padding_value=0)
+            model_batch_data["action_masks"] = pad_sequence(model_batch_data["action_masks"], 
+                                                         batch_first=True, 
+                                                         padding_value=0)
+            
+            print(f"  Данные подготовлены успешно.")
+            
+        except Exception as e:
+            print(f"{COLOR_RED}Ошибка при подготовке данных: {e}{COLOR_RESET}")
+            print(f"{COLOR_RED}Пропускаем шаг обучения.{COLOR_RESET}")
+            # Увеличиваем счетчик глобальных шагов и продолжаем
+            global_step += 1
+            continue
         
         # Теперь вызываем функцию с правильными аргументами
         experiences = process_episode_batch(
@@ -1442,16 +1582,26 @@ def main():
         # Собираем статистику для логирования
         batch_total_production = []
         batch_total_rewards = []
+        batch_early_terminations = []
+        batch_first_step_errors = []
+        batch_format_errors = []
         
         # Извлекаем статистику из результатов роллаутов
         for stats in episode_stats:
             batch_total_production.append(stats["production"])
             batch_total_rewards.append(stats["reward"])
+            batch_early_terminations.append(1.0 if stats.get("early_termination", False) else 0.0)
+            batch_first_step_errors.append(1.0 if stats.get("first_step_error", False) else 0.0)
+            batch_format_errors.append(stats.get("skipped_steps", 0))
             
         # --- Логируем статистику собранных данных ---
         batch_step += 1
         mean_batch_production = sum(batch_total_production) / len(batch_total_production) if batch_total_production else 0
         mean_batch_reward = sum(batch_total_rewards) / len(batch_total_rewards) if batch_total_rewards else 0
+        early_termination_rate = sum(batch_early_terminations) / len(batch_early_terminations) if batch_early_terminations else 0
+        first_step_error_rate = sum(batch_first_step_errors) / len(batch_first_step_errors) if batch_first_step_errors else 0
+        mean_format_errors = sum(batch_format_errors) / len(batch_format_errors) if batch_format_errors else 0
+        
         is_best_batch = mean_batch_reward > best_batch_mean_return
         if is_best_batch:
             best_batch_mean_return = mean_batch_reward
@@ -1461,9 +1611,16 @@ def main():
             "batch/mean_reward": mean_batch_reward,
             "batch/is_best": 1.0 if is_best_batch else 0.0,
             "batch/best_mean_reward": best_batch_mean_return,
+            "batch/early_termination_rate": early_termination_rate,
+            "batch/first_step_error_rate": first_step_error_rate,
+            "batch/mean_format_errors": mean_format_errors,
             "buffer/size": len(replay_buffer),
         })
-        print(f"  Стат. батча: Ср. добыча={mean_batch_production:.2f}, Ср. награда={mean_batch_reward:.2f}, Лучшая награда={best_batch_mean_return:.2f}")
+        print(f"  Стат. батча: Ср. добыча={mean_batch_production:.2f}, Ср. награда={mean_batch_reward:.2f}, "
+              f"Лучшая награда={best_batch_mean_return:.2f}")
+        print(f"  Ошибки формата: Ранний останов={early_termination_rate*100:.1f}%, "
+              f"Ошибки 1-го шага={first_step_error_rate*100:.1f}%, "
+              f"Ср. ошибок={mean_format_errors:.2f}")
 
         # --- Фаза оптимизации через GRPO ---
         # Создаем DataLoader для буфера опыта

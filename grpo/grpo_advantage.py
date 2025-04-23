@@ -244,7 +244,15 @@ def process_episode_batch(
         batch_ref_log_probs.append(episode_ref_log_probs)
         # Для returns создаем тензор той же формы что и advantages, 
         # но с единым значением для всего эпизода (сумма наград)
-        batch_returns.append(torch.ones_like(episode_advantages) * episode_rewards[-1])
+        if len(episode_rewards) > 0:
+            # Используем последнюю награду в эпизоде
+            return_value = episode_rewards[-1]
+        else:
+            # Если список наград пуст, используем 0 как значение по умолчанию
+            return_value = 0.0
+            print(f"Предупреждение: эпизод с пустым списком наград! Используем значение по умолчанию: {return_value}")
+        
+        batch_returns.append(torch.ones_like(episode_advantages) * return_value)
     
     # Паддинг (дополнение) и объединение данных из разных эпизодов
     # Используем torch.nn.utils.rnn.pad_sequence для паддинга

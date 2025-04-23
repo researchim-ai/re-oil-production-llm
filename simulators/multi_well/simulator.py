@@ -59,16 +59,37 @@ class MultiWellSimulator:
         
     def reset(self) -> np.ndarray:
         """
-        Сбрасывает симулятор к начальному состоянию.
+        Сбрасывает симулятор в начальное состояние.
         
         Returns:
-            np.ndarray: Начальное состояние системы, включающее состояния всех скважин
+            np.ndarray: Начальное состояние [давление1, bhp1, добыча1, время1, давление2, ...]
         """
-        # Сбрасываем состояние каждой скважины
-        states = [sim.reset() for sim in self.simulators]
+        # Обнуляем время и накопленную добычу
+        self.time = 0.0
+        self.cumulative_production = 0.0
         
-        # Объединяем все состояния в один вектор
-        self.state = np.concatenate(states)
+        # Инициализируем состояние для каждой скважины
+        state_blocks = []
+        for i in range(self.n_wells):
+            # Для каждой скважины состояние содержит:
+            # - пластовое давление
+            # - забойное давление (BHP)
+            # - накопленную добычу
+            # - время (для всех скважин одинаково)
+            well_state = np.array([
+                self.initial_reservoir_pressure,  # начальное пластовое давление
+                self.initial_bhp,                 # начальное забойное давление
+                0.0,                              # начальная накопленная добыча
+                0.0                               # начальное время
+            ])
+            state_blocks.append(well_state)
+        
+        # Объединяем состояния всех скважин в один вектор
+        self.state = np.concatenate(state_blocks)
+        
+        # Инициализируем переменные для отслеживания последовательности действий
+        self.previous_actions = np.zeros(self.n_wells)
+        self.previous_reward = 0.0
         
         return self.state
     
@@ -179,7 +200,76 @@ class MultiWellSimulator:
             self.state[i * self.state_dim_per_well + 3] = self.time
 
         # 6. Считаем общую награду как сумму дебитов всех скважин
-        reward = sum(current_rates)
+        base_reward = sum(current_rates)
+
+        # Улучшенная система вознаграждений
+        # Фазы разработки месторождения
+        early_phase = self.time < 0.25 * self.max_time  # Ранняя фаза
+        mid_phase = 0.25 * self.max_time <= self.time < 0.7 * self.max_time  # Средняя фаза
+        late_phase = self.time >= 0.7 * self.max_time  # Поздняя фаза
+        
+        # Бонусы и штрафы зависят от фазы разработки
+        phase_multiplier = 1.0
+        
+        if early_phase:
+            # В начале разработки важно не допустить быстрого истощения
+            # Штраф за слишком высокую суммарную добычу в начале
+            if base_reward > 0.6 * self.n_wells * self.initial_reservoir_pressure * 0.1:  # примерный максимальный дебит
+                phase_multiplier *= 0.7
+            
+            # Бонус за сбалансированную разработку (избегаем перекоса на одну скважину)
+            rate_variance = np.var(current_rates) / (np.mean(current_rates) + 1e-6)**2  # нормализованная дисперсия
+            balance_factor = np.exp(-5 * rate_variance)  # максимум при равномерной добыче
+            phase_multiplier *= 1.0 + 0.5 * balance_factor
+            
+        elif mid_phase:
+            # В средней фазе важно поддерживать стабильную добычу
+            # Бонус за стабильность дебита относительно предыдущего шага
+            if hasattr(self, 'previous_reward'):
+                rate_change = abs(base_reward - self.previous_reward) / (self.previous_reward + 1e-6)
+                stability_factor = np.exp(-3 * rate_change)  # максимум при стабильном дебите
+                phase_multiplier *= 1.0 + 0.3 * stability_factor
+                
+        else:  # late_phase
+            # В поздней фазе максимизируем добычу
+            # Бонус за высокий дебит
+            max_theoretical_rate = self.n_wells * (self.initial_reservoir_pressure * 0.3) * 0.1  # приблизительный
+            rate_ratio = base_reward / max_theoretical_rate
+            phase_multiplier *= 1.0 + 0.6 * rate_ratio
+        
+        # Бонус за оптимальную стратегию последовательности действий
+        strategy_multiplier = 1.0
+        
+        if hasattr(self, 'previous_actions'):
+            # Идеальные изменения зависят от фазы
+            if early_phase:
+                # В начале мягкое увеличение дебита
+                ideal_changes = np.ones(self.n_wells) * 0.05
+            elif mid_phase:
+                # В середине стабильность
+                ideal_changes = np.zeros(self.n_wells)
+            else:  # late_phase
+                # В конце агрессивное увеличение дебита
+                ideal_changes = np.ones(self.n_wells) * 0.1
+                
+            # Рассчитываем отклонение от идеальной стратегии
+            actual_changes = actions - self.previous_actions
+            change_deviations = np.abs(actual_changes - ideal_changes)
+            mean_deviation = np.mean(change_deviations)
+            
+            # Штраф за отклонение от идеальной стратегии
+            strategy_multiplier = np.exp(-3 * mean_deviation)
+            
+            # Штраф за слишком резкие изменения
+            if np.max(np.abs(actual_changes)) > 0.3:
+                strategy_multiplier *= 0.7
+                
+        # Сохраняем текущие действия и награду для следующего шага
+        self.previous_actions = actions.copy()
+        self.previous_reward = base_reward
+        
+        # Применяем множители к базовой награде
+        reward = base_reward * phase_multiplier * strategy_multiplier
 
         # 7. Проверяем условие завершения
         # Симуляция завершается, если:
