@@ -104,16 +104,18 @@ class SingleWellSimulator:
         ])
 
         # 7. Рассчитываем награду
-        reward = current_flow_rate / 10
-        
-        # Улучшенная функция награды с reward shaping
-        # Бонус за поддержание высокого давления пласта (устойчивая добыча)
-        if self.reservoir_pressure > 0.5 * self.initial_reservoir_pressure:
-            reward *= 1.2  # Бонус за сохранение высокого давления
-        
-        # Штраф за слишком интенсивную добычу на ранних стадиях
-        if self.time < 0.3 * self.max_time and current_flow_rate > 0.7 * self.pi * self.initial_reservoir_pressure:
-            reward *= 0.8  # Штраф за слишком агрессивную эксплуатацию в начале
+        # reward = current_flow_rate / 10 # Старая базовая награда
+        # Награда теперь равна объему, добытому за текущий шаг
+        reward = volume_produced_this_step
+
+        # # Улучшенная функция награды с reward shaping (пока убрано для упрощения)
+        # # Бонус за поддержание высокого давления пласта (устойчивая добыча)
+        # if self.reservoir_pressure > 0.5 * self.initial_reservoir_pressure:
+        #     reward *= 1.2  # Бонус за сохранение высокого давления
+        # 
+        # # Штраф за слишком интенсивную добычу на ранних стадиях
+        # if self.time < 0.3 * self.max_time and current_flow_rate > 0.7 * self.pi * self.initial_reservoir_pressure:
+        #     reward *= 0.8  # Штраф за слишком агрессивную эксплуатацию в начале
 
         # 8. Проверяем условие завершения эпизода
         # Завершаем, если время вышло или давление пласта упало ниже BHP (приток прекратился)

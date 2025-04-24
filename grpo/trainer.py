@@ -237,7 +237,10 @@ def load_model(
     use_4bit: bool = True,
     use_lora: bool = True,
 ) -> tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path, 
+        padding_side='left' # Добавляем padding_side='left'
+    )
     tokenizer.pad_token = tokenizer.eos_token
 
     if use_4bit:
@@ -826,35 +829,43 @@ def rollout_simulator(
     # Проверяем, имеем ли мы дело с многоскважинным симулятором
     is_multi_well = hasattr(simulator, 'well_names') and len(getattr(simulator, 'well_names', [])) > 1
     
-    # Сохраняем историю диалога
-    history = []
-    
+    # Сохраняем историю диалога как пары (состояние, действие)
+    history: List[Tuple[str, Optional[float]]] = []
+
     episode_production = 0.0
     total_reward = 0.0
-    
-    # Для одного роллаута не используем заготовленный шаблон PROMPT_TEMPLATE, 
+    skipped_steps = 0 # Счетчик пропущенных шагов из-за формата
+    max_new_tokens_per_step = args.max_new_tokens_per_step if hasattr(args, 'max_new_tokens_per_step') else 10 # Используем args или значение по умолчанию
+
+    # Для одного роллаута не используем заготовленный шаблон PROMPT_TEMPLATE,
     # а используем функции из модуля prompts.py
-    
+
     if verbose:
         print("Начинаем новый эпизод")
-    
+
     # Выполняем шаги симуляции
     for step in range(max_steps):
         # Форматируем состояние
         state_text = format_state(state, simulator)
-        
+
         # Получаем промпт на основе текущего состояния и истории
         if not history:
             # Первый шаг эпизода
             prompt = get_first_step_prompt(state_text, is_multi_well)
+            last_action_str = "N/A" # На первом шаге предыдущего действия нет
         else:
             # Последующие шаги с историей
-            history_text = ' | '.join(history[-2:])  # Ограничиваем 2 последними шагами
-            prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
-        
+            # Собираем только тексты состояний для истории
+            history_states = [h[0] for h in history[-2:]] # Берем тексты состояний за 2 последних шага
+            history_text = ' | '.join(history_states)
+            # Берем последнее действие
+            last_action_value = history[-1][1]
+            last_action_str = f"{last_action_value:.4f}" if last_action_value is not None else "Пропущено (ошибка формата)"
+            # Вызываем обновленную функцию
+            prompt = get_subsequent_step_prompt(state_text, history_text, last_action_str, is_multi_well)
+
         if verbose:
             print(f"\nШаг {step+1}/{max_steps}")
-            print(f"Промпт:\n{prompt}")
 
         # Токенизируем запрос
         tokenized_prompt = tokenizer(
@@ -903,108 +914,138 @@ def rollout_simulator(
         # Проверяем, правильный ли формат
         if action_value is not None:
             # Применяем действие к симулятору
-            simulator.step(action_value)
-            
-            # Получаем новое состояние и награду
-            new_state = simulator.state
-            # Награда за шаг = добыча за текущий шаг
-            step_reward = new_state[2] - state[2] 
-            
+            # Важно: используем action_value, а не response_text
+            new_state, step_reward, done, info = simulator.step(action_value)
+
             # Добавляем награды за форматирование ответа
             format_reward = sum(format_rewards.values())
             total_format_reward = format_reward
             episode_format_rewards.append(format_rewards)
-            
+
             # Общая награда включает награду за действие и за форматирование
+            # Используем step_reward, который уже равен volume_produced_this_step из симулятора
             full_step_reward = step_reward + total_format_reward
-            
+
             # Обновляем общую награду и добычу
             total_reward += full_step_reward
-            episode_production = new_state[2]  # Общая добыча - третий элемент в state
-            
-            episode_rewards.append(torch.tensor(full_step_reward))
+            # Обновляем накопленную добычу из нового состояния (если есть)
+            if len(new_state) > 2:
+                 episode_production = new_state[2]
+            elif hasattr(simulator, 'cumulative_production'): # Для MultiWell
+                 episode_production = simulator.cumulative_production
+
+            episode_rewards.append(torch.tensor(full_step_reward, device=device)) # Переносим на device
             episode_actions.append(action_value)
-            
+
             # Создаем маску для токенов действия
-            # Все токены ответа модели (отличные от промта) помечаются как действия
-            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool)
+            # Все токены ответа модели (отличные от промпта) помечаются как действия
+            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool, device=device) # На device
             action_mask[prompt_length:] = True
             episode_action_masks.append(action_mask)
-            
+
             # Сохраняем позиции токенов действия для более точного распределения наград
-            action_positions = torch.arange(prompt_length, len(full_sequence))
+            action_positions = torch.arange(prompt_length, len(full_sequence), device=device) # На device
             episode_action_positions.append(action_positions)
-            
-            print(f"Симулятор: Шаг {step+1}, Награда: {full_step_reward:.4f}, Общая награда: {total_reward:.4f}, Добыча: {episode_production:.2f} м³")
-            
-            # Обновляем текущее состояние и сохраняем последнее успешное состояние
-            history.append(state_text)
+
+            print(f"Симулятор: Шаг {step+1}, Награда: {full_step_reward:.4f} (Добыча: {step_reward:.4f}, Формат: {total_format_reward:.2f}), Общая награда: {total_reward:.4f}, Добыча: {episode_production:.2f} м³")
+
+            # Обновляем текущее состояние и сохраняем его вместе с действием
+            history.append((state_text, action_value)) # Сохраняем пару (состояние, действие)
             state = new_state
+            skipped_steps = 0 # Сбрасываем счетчик пропусков при успешном шаге
         else:
             # Если формат неправильный, даем отрицательную награду, но не выполняем шаг симулятора
             format_reward = sum(format_rewards.values())
             total_format_reward = format_reward
             episode_format_rewards.append(format_rewards)
-            
+
             # Отрицательная награда только за формат
             full_step_reward = total_format_reward
             total_reward += full_step_reward
-            
-            episode_rewards.append(torch.tensor(full_step_reward))
+
+            episode_rewards.append(torch.tensor(full_step_reward, device=device)) # На device
             episode_actions.append(0.0)  # Действие не выполнялось, но в списке должно быть значение
-            
+
             # Создаем маску для токенов действия
-            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool)
+            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool, device=device) # На device
             action_mask[prompt_length:] = True
             episode_action_masks.append(action_mask)
-            
+
             # Сохраняем позиции токенов действия для более точного распределения наград
-            action_positions = torch.arange(prompt_length, len(full_sequence))
+            action_positions = torch.arange(prompt_length, len(full_sequence), device=device) # На device
             episode_action_positions.append(action_positions)
-            
+
             print(f"Симулятор: Шаг {step+1} ПРОПУЩЕН из-за неправильного формата, Штраф: {full_step_reward:.4f}, Общая награда: {total_reward:.4f}")
+            # Сохраняем состояние, но указываем None как действие
+            history.append((state_text, None)) # Сохраняем пару (состояние, None)
             skipped_steps += 1
-        
-        step += 1
-        
+
+        # Убрал step += 1 здесь, т.к. он в цикле for
+        # Убрал проверку done здесь, т.к. она проверяется циклом for и break ниже
+
         # Если слишком много пропущенных шагов подряд, прерываем эпизод
         if skipped_steps > 5:
-            print(f"Симулятор: Слишком много пропущенных шагов, прерываем эпизод.")
+            print(f"{COLOR_YELLOW}Симулятор: Слишком много пропущенных шагов подряд ({skipped_steps}), прерываем эпизод.{COLOR_RESET}")
             break
-    
+
+        # Проверяем done из симулятора
+        if done:
+            print(f"{COLOR_MAGENTA}Симулятор: Эпизод завершен по условию симулятора (time >= max_time или depletion).{COLOR_RESET}")
+            break
+
+    # --- Конец цикла симуляции ---
+
     # Объединяем все токены и маски для эпизода
     if episode_tokens:
-        # Объединяем все последовательности в одну
-        episode_full_tokens = torch.cat(episode_tokens)
-        
-        # Создаем полную маску действий
-        episode_full_action_mask = torch.zeros(len(episode_full_tokens), dtype=torch.bool, device=device)
-        
+        # Проверяем device перед конкатенацией
+        target_device = episode_tokens[0].device
+        episode_tokens_on_device = [t.to(target_device) for t in episode_tokens]
+        episode_full_tokens = torch.cat(episode_tokens_on_device) # Объединяем токены
+
+        # Создаем полную маску действий на правильном device
+        episode_full_action_mask = torch.zeros_like(episode_full_tokens, dtype=torch.bool, device=target_device)
+
         # Заполняем маску на основе позиций
         offset = 0
-        for action_mask in episode_action_masks:
-            length = len(action_mask)
-            episode_full_action_mask[offset:offset+length] = action_mask
+        for i, action_mask in enumerate(episode_action_masks):
+            # Убедимся, что маска на том же устройстве
+            action_mask_on_device = action_mask.to(target_device)
+            length = len(action_mask_on_device)
+            # Проверим границы перед присваиванием
+            if offset + length <= len(episode_full_action_mask):
+                 episode_full_action_mask[offset:offset+length] = action_mask_on_device
+            else:
+                 # Если длина маски выходит за пределы, обрезаем
+                 remaining_len = len(episode_full_action_mask) - offset
+                 if remaining_len > 0:
+                     episode_full_action_mask[offset:] = action_mask_on_device[:remaining_len]
+                 print(f"{COLOR_YELLOW}Предупреждение: Маска действия {i} обрезана из-за превышения длины последовательности.{COLOR_RESET}")
             offset += length
-        
+
         # Собираем статистику эпизода
+        final_steps = step + 1 # Количество выполненных шагов
         episode_stats = {
             "reward": total_reward,
             "production": episode_production,
-            "steps": step - 1,
+            "steps": final_steps,
             "actions": episode_actions,
-            "format_rewards": episode_format_rewards,
-            "action_positions": episode_action_positions,
+            "format_rewards": episode_format_rewards, # Список словарей наград за формат по шагам
+            # "action_positions": episode_action_positions, # Можно убрать если не используется дальше
             "skipped_steps": skipped_steps
         }
-        
-        # Добавляем данные эпизода в общие списки
-        all_episodes_tokens.append(episode_full_tokens)
-        all_episodes_action_masks.append(episode_full_action_mask)
-        all_episodes_rewards.append(torch.tensor(episode_rewards))
-        all_episodes_stats.append(episode_stats)
-    
-    return all_episodes_tokens, all_episodes_action_masks, all_episodes_rewards, all_episodes_stats
+
+        # Возвращаем собранные данные для эпизода
+        return episode_full_tokens, episode_full_action_mask, torch.tensor(episode_rewards, device=target_device), episode_stats
+    else:
+        # Если не было собрано ни одного токена
+        print(f"{COLOR_YELLOW}Предупреждение: Эпизод завершился без единого шага или токена.{COLOR_RESET}")
+        empty_tensor = torch.empty(0, dtype=torch.long, device=device)
+        empty_rewards = torch.empty(0, dtype=torch.float, device=device)
+        empty_stats = {
+            "reward": 0, "production": 0, "steps": 0, "actions": [],
+            "format_rewards": [], "skipped_steps": skipped_steps
+        }
+        return empty_tensor, empty_tensor.bool(), empty_rewards, empty_stats
 
 def format_state(state, simulator):
     """
@@ -1170,8 +1211,9 @@ def main():
     train_batch_size = args.train_batch_size
     lr = args.lr
     rollouts_per_step = args.rollouts_per_step
-    max_length = 4096  # Увеличиваем для предотвращения пропуска эпизодов
-    max_new_tokens_per_step = 5  # Ограничиваем до 5 токенов, нам нужно только число
+    max_length = args.max_length # Восстанавливаем определение из args
+    # max_length = 4096 # Старое значение, теперь берем из args
+    max_new_tokens_per_step = args.max_new_tokens_per_step # Используем аргумент
     temperature = args.temperature
     top_p = args.top_p
     log_completions_interval = args.log_completions_interval
@@ -1311,15 +1353,41 @@ def main():
         )
         
         # Выполняем параллельные роллауты
-        episode_tokens, action_masks, rewards, episode_stats = parallel_rollout(
+        all_episodes_data = parallel_rollout(
             model=model,
             tokenizer=tokenizer,
             parallel_sim=parallel_sim,
-            n_steps=int(args.simulation_max_time / args.simulation_dt),  # Максимальное количество шагов
+            n_steps=int(args.simulation_max_time / (args.simulation_dt * args.forecast_days)), # Учитываем dt и forecast_days
             temperature=temperature,
-            verbose=True
+            top_p=top_p, # Добавляем top_p
+            verbose=True # Включаем вывод из parallel_rollout
+            # args=args # Убираем и этот аргумент
         )
-        
+
+        # Распаковываем результаты
+        # all_episodes_data - это кортеж из 4 списков
+        episode_tokens, action_masks, rewards, episode_stats = all_episodes_data
+        # episode_tokens = [data[0] for data in all_episodes_data] # Старая неправильная распаковка
+        # action_masks = [data[1] for data in all_episodes_data]
+        # rewards = [data[2] for data in all_episodes_data]
+        # episode_stats = [data[3] for data in all_episodes_data]
+
+
+        # Фильтруем пустые эпизоды, которые могли вернуться из rollout_simulator
+        valid_indices = [i for i, tokens in enumerate(episode_tokens) if tokens.numel() > 0]
+        if len(valid_indices) < len(episode_tokens):
+             print(f"{COLOR_YELLOW}Предупреждение: {len(episode_tokens) - len(valid_indices)} пустых эпизодов отфильтровано после роллаутов.{COLOR_RESET}")
+             episode_tokens = [episode_tokens[i] for i in valid_indices]
+             action_masks = [action_masks[i] for i in valid_indices]
+             rewards = [rewards[i] for i in valid_indices]
+             episode_stats = [episode_stats[i] for i in valid_indices]
+
+        # Проверяем, остались ли эпизоды после фильтрации
+        if not episode_tokens:
+             print(f"{COLOR_RED}Не удалось собрать ни одного валидного эпизода после фильтрации. Пропускаем шаг обучения.{COLOR_RESET}")
+             global_step += 1
+             continue # Переходим к следующему global_step
+
         # Обрабатываем результаты и создаем буфер опыта
         # Подготавливаем данные в нужном формате для process_episode_batch
         device = next(model.parameters()).device
@@ -1428,7 +1496,7 @@ def main():
             actions_batch=actions_batch,
             device=device,
             gamma=args.gamma,
-            window_size=max_length,
+            window_size=max_length, # Теперь max_length определен
             total_steps=len(rewards[0]) if rewards else 0,
             normalize_advantages=True
         )

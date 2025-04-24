@@ -100,42 +100,48 @@ class ParallelSimulator:
         
         return results
     
-    def get_prompts(self, histories: Optional[List[List[str]]] = None) -> List[str]:
+    def get_prompts(self, histories: Optional[List[List[Tuple[str, str]]]] = None) -> List[str]:
         """
-        Формирует промпты для всех симуляторов с учетом их текущих состояний.
-        
+        Формирует промпты для всех симуляторов с учетом их текущих состояний и полной истории.
+
         Args:
-            histories: Список историй для каждого симулятора
-            
+            histories: Список полных историй для каждого симулятора.
+                       Каждая история - список кортежей (форматированное_состояние, форматированное_действие).
+
         Returns:
             List[str]: Список промптов для всех симуляторов
         """
         if histories is None:
             histories = [[] for _ in range(self.n_simulators)]
-        
+
         prompts = []
         for i, (state, history) in enumerate(zip(self.current_states, histories)):
             simulator = self.simulators[i]
             state_text = self.format_state(state, simulator)
-            
-            # Проверяем тип симулятора (одна или несколько скважин)
+
+            # Проверяем тип симулятора
             is_multi_well = hasattr(simulator, 'well_names') and len(getattr(simulator, 'well_names', [])) > 1
-            
-            # Ограничиваем историю до 2 последних взаимодействий для экономии токенов
-            if len(history) > 2:
-                history = history[-2:]
-            
+
             # Используем разные шаблоны в зависимости от наличия истории
             if not history:
                 # Первый шаг эпизода
                 prompt = get_first_step_prompt(state_text, is_multi_well)
             else:
-                # Последующие шаги с историей
-                history_text = ' | '.join(history)
-                prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
-            
+                # Последующие шаги с ПОЛНОЙ историей
+                # Формируем текстовое представление полной истории
+                full_history_lines = []
+                for step_idx, (hist_state, hist_action) in enumerate(history):
+                    full_history_lines.append(f"Шаг {step_idx + 1}: Состояние: {hist_state}, Действие: {hist_action}")
+                full_history_text = "\n".join(full_history_lines)
+
+                # Извлекаем последнее действие
+                last_action_str = history[-1][1] # Берем строку действия из последнего кортежа
+
+                # Вызываем обновленный get_subsequent_step_prompt
+                prompt = get_subsequent_step_prompt(state_text, full_history_text, last_action_str, is_multi_well)
+
             prompts.append(prompt)
-        
+
         return prompts
     
     def format_state(self, state, simulator):
@@ -294,6 +300,7 @@ def parallel_rollout(
 ]:
     """
     Выполняет параллельные роллауты для всех симуляторов.
+    Сохраняет полную историю (состояние, действие) для промптов.
     
     Args:
         model: Языковая модель
@@ -311,7 +318,7 @@ def parallel_rollout(
             all_rewards: Список тензоров с наградами
             all_episode_stats: Список словарей со статистикой
     """
-    model.eval()  # Переводим модель в режим оценки
+    model.eval()
     device = next(model.parameters()).device
     
     n_simulators = parallel_sim.n_simulators
@@ -325,25 +332,25 @@ def parallel_rollout(
     # Инициализируем счетчики для отслеживания прогресса
     steps_completed = [0] * n_simulators
     episodes_done = [False] * n_simulators
-    skipped_steps = [0] * n_simulators  # Счетчик пропущенных шагов для каждого симулятора
-    
-    # Истории для каждого симулятора
-    histories = [[] for _ in range(n_simulators)]
-    
+    skipped_steps = [0] * n_simulators
+
+    # Истории для каждого симулятора (список кортежей: state_str, action_str)
+    histories: List[List[Tuple[str, str]]] = [[] for _ in range(n_simulators)]
+
     # Данные эпизодов
     episode_tokens_list = [[] for _ in range(n_simulators)]
     episode_action_masks_list = [[] for _ in range(n_simulators)]
     episode_rewards_list = [[] for _ in range(n_simulators)]
-    episode_actions_list = [[] for _ in range(n_simulators)]
+    episode_actions_list = [[] for _ in range(n_simulators)] # Храним фактические float действия
     episode_total_rewards = [0.0] * n_simulators
     episode_production = [0.0] * n_simulators
-    episode_format_rewards_list = [[] for _ in range(n_simulators)]  # Добавляем список для хранения формата наград
-    
+    episode_format_rewards_list = [[] for _ in range(n_simulators)]
+
     start_time = time.time()
     
     # Создаем конфигурацию генерации
     generation_config = GenerationConfig(
-        max_new_tokens=10,  # Ограничиваем длину генерации для эффективности
+        max_new_tokens=10,
         do_sample=True,
         temperature=temperature,
         top_p=top_p,
@@ -364,9 +371,9 @@ def parallel_rollout(
                 print(f"{COLOR_YELLOW}Все эпизоды завершены, останавливаем симуляцию{COLOR_RESET}")
             break
         
-        # Получаем промпты только для активных симуляторов
+        # Получаем промпты только для активных симуляторов, передавая полные истории
         active_histories = [histories[i] for i in active_indices]
-        prompts = parallel_sim.get_prompts(active_histories)
+        prompts = parallel_sim.get_prompts(active_histories) # get_prompts теперь использует полные истории
         
         # Токенизируем все промпты
         tokenized_inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
@@ -388,127 +395,124 @@ def parallel_rollout(
                 ], dim=1)
         
         # Извлекаем новые токены и действия
-        actions = []
-        valid_actions = []  # Список для хранения валидных действий
-        valid_indices = []  # Список для хранения индексов валидных действий
-        for i, idx in enumerate(active_indices):
+        actions = [] # Список действий (float или None) на этом шаге для активных симуляторов
+        action_strs = [] # Список действий (строка) на этом шаге для активных симуляторов
+        valid_action_values = []  # Список для хранения валидных float действий
+        valid_sim_indices = [] # Индексы симуляторов (относительно active_indices), где действие было валидным
+
+        current_step_states = [parallel_sim.format_state(parallel_sim.current_states[active_indices[i]], parallel_sim.simulators[active_indices[i]]) for i in range(len(active_indices))]
+
+        for i, idx in enumerate(active_indices): # idx - абсолютный индекс симулятора
             # Получаем только новые токены (без промпта)
-            # Batch size может быть > 1, поэтому берем соответствующую строку
             new_tokens = outputs[i, tokenized_inputs.input_ids.shape[1]:]
             
             # Декодируем ответ
             response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
             
             if verbose:
-                print(f"Симулятор {idx+1}: {COLOR_GREEN}Ответ модели:{COLOR_RESET} '{response}'")
+                print(f"Симулятор {idx+1}: {COLOR_GREEN}Ответ модели:{COLOR_RESET} \'{response}\'")
             
-            # Очищаем ответ от символов, которые модель часто повторяет
-            response = re.sub(r'(\*+)', '', response)  # Удаляем звездочки
-            response = re.sub(r'`+', '', response)      # Удаляем обратные кавычки
-            response = re.sub(r'\s+', ' ', response).strip()  # Нормализуем пробелы
+            # Очищаем ответ
+            response = re.sub(r'(\\*+)', '', response)
+            response = re.sub(r'`+', '', response)
+            response = re.sub(r'\s+', ' ', response).strip()
             
             # Извлекаем действие из ответа
-            action, format_rewards = parallel_sim.parse_llm_action(response)
-            
-            if action is not None:
+            action_value, format_rewards = parallel_sim.parse_llm_action(response)
+            action_str = f"{action_value:.4f}" if action_value is not None else "Пропущено (ошибка формата)"
+            actions.append(action_value)
+            action_strs.append(action_str)
+            episode_format_rewards_list[idx].append(format_rewards) # Сохраняем награду за формат
+
+            if action_value is not None:
                 if verbose:
-                    print(f"Симулятор {idx+1}: {COLOR_YELLOW}Действие:{COLOR_RESET} {action:.4f}")
+                    print(f"Симулятор {idx+1}: {COLOR_YELLOW}Действие:{COLOR_RESET} {action_value:.4f}")
                     print(f"Симулятор {idx+1}: {COLOR_BLUE}Награды за форматирование:{COLOR_RESET} {format_rewards}")
-                
-                # Сохраняем действие и индекс
-                valid_actions.append(action)
-                valid_indices.append(i)
-                skipped_steps[idx] = 0  # Сбрасываем счетчик пропущенных шагов
+
+                # Сохраняем валидное действие и индекс
+                valid_action_values.append(action_value)
+                valid_sim_indices.append(i) # Сохраняем индекс внутри active_indices
+                skipped_steps[idx] = 0
             else:
                 if verbose:
                     print(f"Симулятор {idx+1}: {COLOR_RED}Действие пропущено из-за неправильного формата{COLOR_RESET}")
                     print(f"Симулятор {idx+1}: {COLOR_BLUE}Штраф за форматирование:{COLOR_RESET} {format_rewards}")
-                
-                # Отмечаем шаг как пропущенный и увеличиваем счетчик
+
                 skipped_steps[idx] += 1
-                
-                # Если слишком много пропущенных шагов подряд, завершаем эпизод
                 if skipped_steps[idx] > 5:
                     if verbose:
                         print(f"{COLOR_RED}Симулятор {idx+1}: Слишком много пропущенных шагов подряд, завершаем эпизод.{COLOR_RESET}")
                     episodes_done[idx] = True
-            
-            # Заполняем пустым значением (будет игнорироваться, если шаг пропущен)
-            actions.append(action if action is not None else 0.0)
-            episode_actions_list[idx].append(action if action is not None else 0.0)
-            episode_format_rewards_list[idx].append(format_rewards)  # Сохраняем формат наград
-            
+
+            # Сохраняем float действие (или 0.0 если невалидно) для статистики
+            episode_actions_list[idx].append(action_value if action_value is not None else 0.0)
+
             # Сохраняем токены действия в любом случае (для обучения)
             action_tokens = new_tokens
-            
-            # Убеждаемся, что тензор не пустой
             if action_tokens.numel() == 0:
-                action_tokens = torch.tensor([tokenizer.encode("0", add_special_tokens=False)[0]], 
-                                          device=device)
-            
+                action_tokens = torch.tensor([tokenizer.encode("0", add_special_tokens=False)[0]], device=device)
             episode_tokens_list[idx].append(action_tokens)
-            
-            # Создаем маску действий - улучшенная версия
-            # Маскируем все токены ответа, независимо от того, валидный формат или нет
+
+            # Создаем маску действий
             action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
             episode_action_masks_list[idx].append(action_mask)
-            
-            # Добавляем информацию в историю только если действие было валидным
-            if action is not None:
-                current_state = parallel_sim.current_states[idx]
-                histories[idx].append(f"Сост:{parallel_sim.format_short_state(current_state)}, Д:{action:.2f}")
-        
+
+            # Добавляем пару (форматированное_состояние, форматированное_действие) в историю
+            current_state_str = current_step_states[i] # Берем предрасчитанное состояние
+            histories[idx].append((current_state_str, action_str)) # Добавляем кортеж в историю
+
         # Если есть валидные действия, выполняем шаг для соответствующих симуляторов
-        if valid_actions:
-            # Заполняем действия для всех симуляторов (нули для симуляторов с невалидными ответами)
-            all_actions = [0.0] * n_simulators
-            
-            # Заполняем только для активных симуляторов с валидными действиями
-            for i, idx in enumerate(valid_indices):
-                act_idx = active_indices[idx]
-                all_actions[act_idx] = valid_actions[i]
-            
+        if valid_action_values:
+            # Заполняем действия для всех симуляторов (0.0 для невалидных/неактивных)
+            step_actions_all_sims = [0.0] * n_simulators
+            for i, sim_sub_idx in enumerate(valid_sim_indices):
+                abs_idx = active_indices[sim_sub_idx] # Получаем абсолютный индекс
+                step_actions_all_sims[abs_idx] = valid_action_values[i] # Применяем действие
+
             # Выполняем шаг параллельно для всех симуляторов
-            results = parallel_sim.step(all_actions)
-            
+            results = parallel_sim.step(step_actions_all_sims)
+
             # Обрабатываем результаты
-            for idx, (next_state, reward, done, info) in enumerate(results):
-                # Пропускаем неактивные симуляторы или те, где формат был неправильный
-                if episodes_done[idx] or idx not in [active_indices[i] for i in valid_indices]:
-                    continue
-                
-                # Обновляем данные для активного симулятора
-                episode_rewards_list[idx].append(reward + sum(episode_format_rewards_list[idx][-1].values()))
-                full_reward = reward + sum(episode_format_rewards_list[idx][-1].values())
-                episode_total_rewards[idx] += full_reward
-                steps_completed[idx] += 1
-                
-                # Обновляем информацию о добыче
-                if hasattr(parallel_sim.simulators[idx], 'cumulative_production'):
-                    episode_production[idx] = parallel_sim.simulators[idx].cumulative_production
-                
-                if verbose:
-                    print(f"Симулятор {idx+1}: Шаг {steps_completed[idx]}, Награда: {reward:.4f}, "
-                        f"Общая награда: {episode_total_rewards[idx]:.4f}, "
-                        f"Добыча: {episode_production[idx]:.2f} м³")
-                
-                # Если эпизод завершен, отмечаем его
-                episodes_done[idx] = done
-                
-                if done:
+            for i, (next_state, reward, done, info) in enumerate(results):
+                # Обновляем данные только для тех симуляторов, которые были активны и имели валидное действие на этом шаге
+                is_valid_step = (i in active_indices) and (active_indices.index(i) in valid_sim_indices)
+
+                if not episodes_done[i] and is_valid_step:
+                    # Добавляем награду за шаг (добыча + формат)
+                    format_reward_sum = sum(episode_format_rewards_list[i][-1].values())
+                    full_reward = reward + format_reward_sum
+                    episode_rewards_list[i].append(full_reward)
+                    episode_total_rewards[i] += full_reward
+                    steps_completed[i] += 1
+
+                    # Обновляем информацию о добыче
+                    if hasattr(parallel_sim.simulators[i], 'cumulative_production'):
+                        episode_production[i] = parallel_sim.simulators[i].cumulative_production
+
                     if verbose:
-                        print(f"{COLOR_MAGENTA}Симулятор {idx+1}: Эпизод завершен после {steps_completed[idx]} шагов.{COLOR_RESET}")
-        else:
-            # Если нет валидных действий, добавляем штрафы за формат для всех активных симуляторов
-            for i, idx in enumerate(active_indices):
-                format_reward = sum(episode_format_rewards_list[idx][-1].values())
-                episode_rewards_list[idx].append(format_reward)
-                episode_total_rewards[idx] += format_reward
-                
-                if verbose:
-                    print(f"Симулятор {idx+1}: Шаг пропущен, Штраф за формат: {format_reward:.4f}, "
-                        f"Общая награда: {episode_total_rewards[idx]:.4f}")
-    
+                        print(f"Симулятор {i+1}: Шаг {steps_completed[i]}, Награда: {reward:.4f}, "
+                              f"Общая награда: {episode_total_rewards[i]:.4f}, "
+                              f"Добыча: {episode_production[i]:.2f} м³")
+
+                    # Если эпизод завершен, отмечаем его
+                    episodes_done[i] = done
+                    if done and verbose:
+                        print(f"{COLOR_MAGENTA}Симулятор {i+1}: Эпизод завершен после {steps_completed[i]} шагов.{COLOR_RESET}")
+
+        # Если не было валидных действий у АКТИВНЫХ симуляторов на этом шаге, добавляем только штрафы за формат
+        # Проверяем только те, что были активны, но не попали в valid_sim_indices
+        active_but_failed_indices = [active_indices[i] for i, sim_sub_idx in enumerate(active_indices) if i not in valid_sim_indices]
+        for idx in active_but_failed_indices:
+             if not episodes_done[idx]: # Только если эпизод еще не закончен
+                 format_reward_sum = sum(episode_format_rewards_list[idx][-1].values())
+                 episode_rewards_list[idx].append(format_reward_sum) # Добавляем только награду за формат
+                 episode_total_rewards[idx] += format_reward_sum
+                 steps_completed[idx] += 1 # Шаг все равно засчитываем
+
+                 if verbose:
+                     print(f"Симулятор {idx+1}: Шаг {steps_completed[idx]} пропущен (невалидное действие), Штраф за формат: {format_reward_sum:.4f}, "
+                           f"Общая награда: {episode_total_rewards[idx]:.4f}")
+
     # После завершения всех шагов собираем финальные данные
     for idx in range(n_simulators):
         try:

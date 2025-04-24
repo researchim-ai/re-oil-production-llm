@@ -64,9 +64,12 @@ SUBSEQUENT_STEP_PROMPT_TEMPLATE = """
 ЗАДАЧА: {task_description}
 ТРЕБУЕТСЯ: Указать степень открытия штуцера от 0 до 1.
 
-История: {history}
+======== ПОЛНАЯ ИСТОРИЯ ЭПИЗОДА ========
+{history}
+=========================================
+Предыдущее действие (открытие штуцера): {previous_action}
 
-Состояние: {state}
+Текущее состояние: {state}
 
 Управление скважиной осуществляется через штуцер (клапан):
 - 0 означает полностью закрытый штуцер (нет добычи)
@@ -115,17 +118,18 @@ def get_first_step_prompt(state, is_multi_well=False):
     task_description = "Управление добычей нефти в нескольких скважинах." if is_multi_well else "Управление добычей нефти в одной скважине."
     return FIRST_STEP_PROMPT_TEMPLATE.format(state=state, task_description=task_description)
 
-def get_subsequent_step_prompt(state, history, is_multi_well=False):
+def get_subsequent_step_prompt(state, history, previous_action: str, is_multi_well=False):
     """
     Формирует промпт для последующих шагов эпизода.
     
     Args:
         state (str): Форматированное состояние скважины
-        history (str): История предыдущих взаимодействий
+        history (str): История предыдущих состояний
+        previous_action (str): Значение действия, выбранного на предыдущем шаге
         is_multi_well (bool): Флаг, указывающий на тип симулятора
         
     Returns:
         str: Промпт для последующих шагов эпизода
     """
     task_description = "Управление добычей нефти в нескольких скважинах." if is_multi_well else "Управление добычей нефти в одной скважине."
-    return SUBSEQUENT_STEP_PROMPT_TEMPLATE.format(state=state, history=history, task_description=task_description) 
+    return SUBSEQUENT_STEP_PROMPT_TEMPLATE.format(state=state, history=history, previous_action=previous_action, task_description=task_description) 
