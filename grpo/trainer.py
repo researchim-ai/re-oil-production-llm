@@ -313,7 +313,7 @@ SYSTEM_PROMPT_TEMPLATE = """Ты - система управления нефт�
 
 ПРАВИЛА ОТВЕТА:
 1. Ответ должен содержать ТОЛЬКО ОДНО ЧИСЛО от 0 до 1, обозначающее степень открытия штуцера.
-2. НЕ ДОБАВЛЯЙ никаких объяснений, рассуждений или дополнительного текста.
+2. НЕ ДОБАВЛЯЙ никаких объяснений, рассуждений, дополнительного текста или тегов.
 3. ТОЛЬКО ЧИСЛО и ничего больше.
 
 Примеры правильных ответов:
@@ -329,6 +329,7 @@ SYSTEM_PROMPT_TEMPLATE = """Ты - система управления нефт�
 "0.75, поскольку это оптимальное значение"
 "Степень открытия штуцера: 0.8"
 "Выбираю значение 0.6"
+<parameter>0.7</parameter>
 """
 
 # Первый системный промпт - только для рассуждения и вызова инструмента
@@ -1112,68 +1113,56 @@ def parse_llm_action(response: str) -> Tuple[Optional[float], Dict[str, float]]:
             print(f"Пустой ответ: действие не будет выполнено")
             return None, {"empty_response": -1.0}
         
-        # Проверяем правильный формат <parameter>число</parameter>
-        perfect_pattern = r'<parameter>(.*?)</parameter>'
-        perfect_match = re.search(perfect_pattern, clean_response, re.DOTALL)
+        # Ищем число в тексте для использования как значение
+        number_pattern = r'^([0-9]*\.?[0-9]+)$'
+        number_match = re.search(number_pattern, clean_response)
         
-        if perfect_match:
-            # Extract the value inside the tags
-            value_str = perfect_match.group(1).strip()
+        if number_match:
             try:
-                value = float(value_str)
+                value = float(number_match.group(1))
                 # Limit the range
                 value = max(0.0, min(1.0, value))
                 # Идеальный формат, максимальная награда
-                return value, {"parameter_format": 1.0}
+                return value, {"correct_format": 1.0}
             except ValueError:
-                # If the content inside tags is not a number, use default and give negative reward
-                print(f"Ошибка формата: тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                return None, {"parameter_not_number": -1.0}
+                # If the content is not a valid number, use default and give negative reward
+                print(f"Ошибка формата: не удалось преобразовать в число: '{clean_response}'. Действие не будет выполнено.")
+                return None, {"not_number": -1.0}
         
-        # Более гибкий паттерн для случаев с незакрытыми тегами
-        flexible_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
-        flexible_match = re.search(flexible_pattern, clean_response, re.DOTALL)
-        
-        if flexible_match:
-            # Extract the value inside the tags
-            value_str = flexible_match.group(1).strip()
-            try:
-                value = float(value_str)
-                # Limit the range
-                value = max(0.0, min(1.0, value))
-                # Почти правильный формат, положительная но не максимальная награда
-                print(f"Неполный формат тегов: {clean_response}. Действие будет выполнено, но в следующий раз используйте корректный формат.")
-                return value, {"almost_parameter_format": 0.6}
-            except ValueError:
-                # If the content inside tags is not a number, use default and give negative reward
-                print(f"Ошибка формата: неполный тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                return None, {"parameter_not_number": -1.0}
-        
-        # Ищем число в тексте для использования как значение (но даем отрицательную награду)
+        # Более гибкий поиск числа в тексте
         number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
         number_match = re.search(number_pattern, clean_response)
         if number_match:
-            print(f"Найдено число без правильного формата: {clean_response}. Действие не будет выполнено, используйте формат <parameter>число</parameter>.")
-            return None, {"wrong_format_with_number": -0.8}
+            try:
+                value = float(number_match.group(1))
+                # Limit the range
+                value = max(0.0, min(1.0, value))
+                # Не идеальный формат, но нашли число
+                print(f"Найдено число в тексте: {clean_response}. Действие будет выполнено, но в следующий раз используйте только число.")
+                return value, {"almost_correct_format": 0.4}
+            except ValueError:
+                print(f"Ошибка формата: не удалось преобразовать в число: '{clean_response}'. Действие не будет выполнено.")
+                return None, {"not_number": -1.0}
         
         # Check for explicit cases of full opening/closing for value extraction
         if any(phrase in clean_response.lower() for phrase in ["fully open", "maximum open", "completely open", "полностью открыть"]):
-            print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>1.0</parameter>")
+            print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте только число 1.0")
             return None, {"wrong_format_open": -0.8}
         elif any(phrase in clean_response.lower() for phrase in ["fully close", "completely close", "close the choke", "полностью закрыть"]):
-            print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.0</parameter>")
+            print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте только число 0.0")
             return None, {"wrong_format_close": -0.8}
         elif any(phrase in clean_response.lower() for phrase in ["no change", "maintain", "keep", "без изменений", "сохранить"]):
-            print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.5</parameter>")
+            print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте только число (например, 0.5)")
             return None, {"wrong_format_maintain": -0.8}
         
         # If unable to extract a value, use the default
         print(f"Не удалось извлечь значение из ответа: '{clean_response}'. Действие не будет выполнено.")
-        return None, {"wrong_format_default": -1.0}
+        return None, {"wrong_format": -1.0}
+    
     except Exception as e:
-        # In case of any error, return None to indicate invalid format
-        print(f"Ошибка при обработке ответа: {str(e)}. Действие не будет выполнено.")
-        return None, {"error": -1.0}
+        # Handle any unexpected errors
+        print(f"Ошибка при обработке ответа: {e}")
+        return None, {"parsing_error": -1.0}
 
 def calculate_discounted_returns(rewards, gamma=0.99):
     """

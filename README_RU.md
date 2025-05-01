@@ -69,6 +69,10 @@ python -m grpo.main --forecast_days 1 --simulation_max_time 4 --kl_weight 0.05 -
 --productivity_index     Индекс продуктивности (м3/день/атм)
 --total_volume           Общий объем резервуара (м3)
 --forecast_days          Количество дней для прогноза на каждом шаге
+
+Поиск оптимальных параметров для одной скважины при заданных условиях:
+```
+python scripts/find_step_optimal_choke.py     --initial_pressure 200.0     --initial_bhp 50.0     --productivity_index 0.1     --total_volume 1e6     --simulation_dt 1.0     --forecast_days 1     --simulation_max_time 4     --num_action_steps 11     --output_file results/optimal_strategy_4days.json
 ```
 
 ## Текущее состояние

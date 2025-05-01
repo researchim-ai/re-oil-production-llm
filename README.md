@@ -70,6 +70,12 @@ The script supports multiple parameters for customizing the training process:
 --forecast_days          Number of days to forecast in each step
 ```
 
+Find optimzal parameters:
+```
+python scripts/find_step_optimal_choke.py     --initial_pressure 200.0     --initial_bhp 50.0     --productivity_index 0.1     --total_volume 1e6     --simulation_dt 1.0     --forecast_days 1     --simulation_max_time 4     --num_action_steps 11     --output_file results/optimal_strategy_4days.json
+```
+
+
 ## Current State
 
 The project currently provides fully functional implementations of both single-well and multi-well optimization scenarios. The single-well scenario serves as a simpler baseline and proof of concept, while the multi-well implementation accounts for more complex reservoir dynamics with interactions between wells.
