@@ -239,6 +239,7 @@ def load_model(
 ) -> tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     if use_4bit:
         print("Используется 4-битная квантизация")
@@ -1531,6 +1532,11 @@ def main():
                 
                 # Обратное распространение и оптимизация
                 loss.backward()
+                if batch_idx == 0:  # один раз за эпоху
+                    mean_grad = np.mean([p.grad.abs().mean().item()
+                                        for p in model.parameters() if p.grad is not None])
+                    print(f"Mean |grad| over trainable params: {mean_grad:.2e}")
+
                 # Обрезаем градиенты для стабильности
                 clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 optimizer.step()

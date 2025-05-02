@@ -238,14 +238,30 @@ def process_episode_batch(
         episode_log_probs = torch.clamp(episode_log_probs, min=-20.0, max=0.0)
         episode_ref_log_probs = torch.clamp(episode_ref_log_probs, min=-20.0, max=0.0)
         
-        # Сохраняем данные для эпизода
+        # # Сохраняем данные для эпизода
+        # batch_advantages.append(episode_advantages)
+        # batch_old_log_probs.append(episode_log_probs)
+        # batch_ref_log_probs.append(episode_ref_log_probs)
+        # # Для returns создаем тензор той же формы что и advantages, 
+        # # но с единым значением для всего эпизода (сумма наград)
+        # batch_returns.append(torch.ones_like(episode_advantages) * episode_rewards[-1])
+        
+        # --- NEW ---
+        # Распределяем дисконтированный возврат каждого шага
+        token_level_returns = torch.zeros_like(episode_advantages)
+        for step_idx, step_data in enumerate(episode_data["actions"]):
+            step_return = episode_returns[step_idx]          # γ‑discounted
+            for tok_id in step_data["token_ids"]:            # токены, относящиеся к этому действию
+                if tok_id < token_level_returns.shape[0]:
+                    token_level_returns[tok_id] = step_return
+        # --- END NEW ---
+
         batch_advantages.append(episode_advantages)
         batch_old_log_probs.append(episode_log_probs)
         batch_ref_log_probs.append(episode_ref_log_probs)
-        # Для returns создаем тензор той же формы что и advantages, 
-        # но с единым значением для всего эпизода (сумма наград)
-        batch_returns.append(torch.ones_like(episode_advantages) * episode_rewards[-1])
-    
+        batch_returns.append(token_level_returns)
+
+        # Сохраняем данные для эпизода
     # Паддинг (дополнение) и объединение данных из разных эпизодов
     # Используем torch.nn.utils.rnn.pad_sequence для паддинга
     padded_sequences = pad_sequence(model_batch_data["sequences"], batch_first=True)
@@ -260,7 +276,7 @@ def process_episode_batch(
     
     # Нормализуем advantages, если нужно
     if normalize_advantages:
-        padded_advantages = group_advantages(padded_advantages, padded_action_masks)
+        padded_advantages = group_advantages(padded_returns.clone(), padded_action_masks)
     
     # Создаем Experience
     experience = Experience(

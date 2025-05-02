@@ -448,10 +448,18 @@ def parallel_rollout(
             
             episode_tokens_list[idx].append(action_tokens)
             
-            # Создаем маску действий - улучшенная версия
-            # Маскируем все токены ответа, независимо от того, валидный формат или нет
-            action_mask = torch.ones_like(action_tokens, dtype=torch.bool)
-            episode_action_masks_list[idx].append(action_mask)
+            # --- NEW точная маска только на число ---
+            num_match = re.search(r'<parameter>\s*([\d\.]+)\s*</parameter>', response)
+            mask = torch.zeros_like(action_tokens, dtype=torch.bool)
+            if num_match:
+                num_tokens = tokenizer(num_match.group(1), add_special_tokens=False).input_ids
+                # Число идёт последними токенами ответа → помечаем столько же
+                mask[-len(num_tokens):] = True
+            else:
+                # если формат неправильный – оставляем всю маску (штраф уже начислен)
+                mask[:] = True
+            episode_action_masks_list[idx].append(mask)
+            # --- END NEW ---
             
             # Добавляем информацию в историю только если действие было валидным
             if action is not None:
