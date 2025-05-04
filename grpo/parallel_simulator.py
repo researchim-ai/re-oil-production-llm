@@ -10,14 +10,17 @@ from simulators.single_well.simulator import SingleWellSimulator
 from simulators.multi_well.simulator import MultiWellSimulator
 from grpo.prompts import get_first_step_prompt, get_subsequent_step_prompt, BASE_PROMPT_TEMPLATE
 
-# Константы для цветов в консоли
-COLOR_RESET = "\033[0m"
-COLOR_GREEN = "\033[92m"
-COLOR_RED = "\033[91m"
-COLOR_YELLOW = "\033[93m"
-COLOR_BLUE = "\033[94m"
-COLOR_CYAN = "\033[96m"
-COLOR_MAGENTA = "\033[35m"
+# Импортируем константу для дискретных действий и функции из utils
+from grpo.utils import DISCRETE_ACTIONS, parse_llm_action, COLOR_RESET, COLOR_GREEN, COLOR_RED, COLOR_YELLOW, COLOR_BLUE, COLOR_CYAN, COLOR_MAGENTA
+
+# Константы для цветов в консоли (больше не нужны, импортированы из utils)
+# COLOR_RESET = "\033[0m"
+# COLOR_GREEN = "\033[92m"
+# COLOR_RED = "\033[91m"
+# COLOR_YELLOW = "\033[93m"
+# COLOR_BLUE = "\033[94m"
+# COLOR_CYAN = "\033[96m"
+# COLOR_MAGENTA = "\033[35m"
 
 class ParallelSimulator:
     """
@@ -196,86 +199,17 @@ class ParallelSimulator:
     
     def parse_llm_action(self, response: str) -> Tuple[Optional[float], Dict[str, float]]:
         """
-        Extracts the action value from the LLM response.
+        Извлекает значения действий из ответа модели.
         
         Args:
-            response (str): The LLM response text.
+            response (str): Текст ответа модели.
             
         Returns:
-            Tuple[Optional[float], Dict[str, float]]: A tuple containing the extracted action value (between 0 and 1 or None if format invalid)
-            and a dictionary of format rewards.
+            Tuple[Optional[float], Dict[str, float]]: Кортеж, содержащий извлеченное значение действия 
+            (от 0 до 1 или None, если формат некорректен) и словарь наград за формат.
         """
-        try:
-            # Clean up the response
-            clean_response = response.strip()
-            
-            # If response is empty, return None to indicate invalid format
-            if not clean_response:
-                print(f"Пустой ответ: действие не будет выполнено")
-                return None, {"empty_response": -1.0}
-            
-            # Проверяем правильный формат <parameter>число</parameter>
-            perfect_pattern = r'<parameter>(.*?)</parameter>'
-            perfect_match = re.search(perfect_pattern, clean_response, re.DOTALL)
-            
-            if perfect_match:
-                # Extract the value inside the tags
-                value_str = perfect_match.group(1).strip()
-                try:
-                    value = float(value_str)
-                    # Limit the range
-                    value = max(0.0, min(1.0, value))
-                    # Идеальный формат, максимальная награда
-                    return value, {"parameter_format": 1.0}
-                except ValueError:
-                    # If the content inside tags is not a number, use default and give negative reward
-                    print(f"Ошибка формата: тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                    return None, {"parameter_not_number": -1.0}
-            
-            # Более гибкий паттерн для случаев с незакрытыми тегами
-            flexible_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
-            flexible_match = re.search(flexible_pattern, clean_response, re.DOTALL)
-            
-            if flexible_match:
-                # Extract the value inside the tags
-                value_str = flexible_match.group(1).strip()
-                try:
-                    value = float(value_str)
-                    # Limit the range
-                    value = max(0.0, min(1.0, value))
-                    # Почти правильный формат, положительная но не максимальная награда
-                    print(f"Неполный формат тегов: {clean_response}. Действие будет выполнено, но в следующий раз используйте корректный формат.")
-                    return value, {"almost_parameter_format": 0.6}
-                except ValueError:
-                    # If the content inside tags is not a number, use default and give negative reward
-                    print(f"Ошибка формата: неполный тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                    return None, {"parameter_not_number": -1.0}
-            
-            # Ищем число в тексте для использования как значение (но даем отрицательную награду)
-            number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
-            number_match = re.search(number_pattern, clean_response)
-            if number_match:
-                print(f"Найдено число без правильного формата: {clean_response}. Действие не будет выполнено, используйте формат <parameter>число</parameter>.")
-                return None, {"wrong_format_with_number": -0.8}
-            
-            # Check for explicit cases of full opening/closing for value extraction
-            if any(phrase in clean_response.lower() for phrase in ["fully open", "maximum open", "completely open", "полностью открыть"]):
-                print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>1.0</parameter>")
-                return None, {"wrong_format_open": -0.8}
-            elif any(phrase in clean_response.lower() for phrase in ["fully close", "completely close", "close the choke", "полностью закрыть"]):
-                print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.0</parameter>")
-                return None, {"wrong_format_close": -0.8}
-            elif any(phrase in clean_response.lower() for phrase in ["no change", "maintain", "keep", "без изменений", "сохранить"]):
-                print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.5</parameter>")
-                return None, {"wrong_format_maintain": -0.8}
-            
-            # If unable to extract a value, use the default
-            print(f"Не удалось извлечь значение из ответа: '{clean_response}'. Действие не будет выполнено.")
-            return None, {"wrong_format_default": -1.0}
-        except Exception as e:
-            # In case of any error, return None to indicate invalid format
-            print(f"Ошибка при обработке ответа: {str(e)}. Действие не будет выполнено.")
-            return None, {"error": -1.0}
+        # Вызываем функцию из utils вместо реализации метода здесь
+        return parse_llm_action(response)
 
 
 def parallel_rollout(
@@ -381,10 +315,12 @@ def parallel_rollout(
             except Exception as e:
                 if verbose:
                     print(f"{COLOR_RED}Ошибка при генерации: {e}{COLOR_RESET}")
-                # Создаем запасной вариант выходов
+                # Создаем запасной вариант выходов с числом "5" вместо "0.5"
+                # Раньше было: torch.ones(...) * tokenizer.encode("0.5", add_special_tokens=False)[0]
+                # Теперь используем "5" как запасной вариант (средний из 10)
                 outputs = torch.cat([
                     tokenized_inputs.input_ids,
-                    torch.ones((len(active_indices), 1), dtype=torch.long, device=device) * tokenizer.encode("0.5", add_special_tokens=False)[0]
+                    torch.ones((len(active_indices), 1), dtype=torch.long, device=device) * tokenizer.encode("5", add_special_tokens=False)[0]
                 ], dim=1)
         
         # Извлекаем новые токены и действия
@@ -448,8 +384,8 @@ def parallel_rollout(
             
             episode_tokens_list[idx].append(action_tokens)
             
-            # --- NEW точная маска только на число ---
-            num_match = re.search(r'<parameter>\s*([\d\.]+)\s*</parameter>', response)
+            # --- NEW точная маска только на число ---
+            num_match = re.search(r'\s*([\d\.]+)\s*', response)
             mask = torch.zeros_like(action_tokens, dtype=torch.bool)
             if num_match:
                 num_tokens = tokenizer(num_match.group(1), add_special_tokens=False).input_ids
@@ -459,7 +395,7 @@ def parallel_rollout(
                 # если формат неправильный – оставляем всю маску (штраф уже начислен)
                 mask[:] = True
             episode_action_masks_list[idx].append(mask)
-            # --- END NEW ---
+            # --- END NEW ---
             
             # Добавляем информацию в историю только если действие было валидным
             if action is not None:

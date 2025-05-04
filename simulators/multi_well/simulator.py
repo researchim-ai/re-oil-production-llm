@@ -35,6 +35,9 @@ class MultiWellSimulator:
         self.shared_reservoir = shared_reservoir
         self.total_volume = total_volume
         
+        # Добавляем сохранение последних действий
+        self.last_actions = [None] * n_wells
+        
         # Распределение объема резервуара между скважинами
         if shared_reservoir:
             # При общем резервуаре каждая скважина использует весь объем
@@ -66,6 +69,9 @@ class MultiWellSimulator:
         """
         # Сбрасываем состояние каждой скважины
         states = [sim.reset() for sim in self.simulators]
+        
+        # Сбрасываем последние действия
+        self.last_actions = [None] * self.n_wells
         
         # Объединяем все состояния в один вектор
         self.state = np.concatenate(states)
@@ -104,6 +110,10 @@ class MultiWellSimulator:
         # Клиппируем действия в диапазон [0, 1]
         actions = np.clip(actions, 0.0, 1.0)
         self.current_valve_openings = actions  # Сохраняем текущие открытия штуцеров
+        
+        # Сохраняем последние действия
+        for i in range(self.n_wells):
+            self.last_actions[i] = actions[i]
 
         # 1. Обновляем время
         self.time += self.dt
