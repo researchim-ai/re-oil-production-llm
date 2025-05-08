@@ -31,42 +31,44 @@ def parse_args():
                         help="Количество эпизодов симуляции на один шаг обучения")
     parser.add_argument('--train_batch_size', type=int, default=8,
                         help="Размер батча для обучения")
-    parser.add_argument('--lr', type=float, default=5e-7,
+    parser.add_argument('--lr', type=float, default=1e-5,
                         help="Скорость обучения")
-    parser.add_argument('--kl_weight', type=float, default=0.02,
+    parser.add_argument('--kl_weight', type=float, default=0.1,
                         help="Вес KL-дивергенции в функции потерь")
     parser.add_argument('--clip_eps', type=float, default=0.2,
                         help="Параметр отсечения для PPO")
+    parser.add_argument('--use_discrete_actions', action='store_true',
+                        help="Использовать дискретные действия (1-10) вместо непрерывных (0-1)")
+    parser.add_argument('--forecast_days', type=int, default=30,
+                        help="Количество дней для прогнозирования на каждом шаге симуляции")
     
-    # Аргументы логирования
-    parser.add_argument('--checkpoint_path', type=str, default="./checkpoints_multi_oil_sim",
+    # Аргументы логирования и чекпоинтов
+    parser.add_argument('--checkpoint_path', type=str, default="checkpoints/multi_well",
                         help="Путь для сохранения чекпоинтов")
-    parser.add_argument('--checkpoint_interval', type=int, default=50,
+    parser.add_argument('--checkpoint_interval', type=int, default=10,
                         help="Интервал сохранения чекпоинтов (в шагах)")
-    parser.add_argument('--log_completions_interval', type=int, default=10,
+    parser.add_argument('--log_completions_interval', type=int, default=5,
                         help="Интервал логирования примеров (в шагах)")
     parser.add_argument('--wandb', action='store_true',
                         help="Использовать WandB для логирования")
-    parser.add_argument('--wandb_project', type=str, default="grpo-multi-oil-simulator",
+    parser.add_argument('--wandb_project', type=str, default="tiny_grpo",
                         help="Название проекта в WandB")
     
-    # Параметры симулятора нескольких скважин
+    # Параметры симулятора (опционально)
     parser.add_argument('--n_wells', type=int, default=3,
                         help="Количество скважин")
-    parser.add_argument('--interaction_strength', type=float, default=0.1,
-                        help="Сила взаимодействия между скважинами (0-1)")
-    parser.add_argument('--shared_reservoir', action='store_true', default=True,
-                        help="Использовать общий резервуар для скважин")
-    parser.add_argument('--total_volume', type=float, default=3e6,
-                        help="Общий объем пласта (м³)")
-    
-    # Параметры отдельных скважин
+    parser.add_argument('--interaction_strength', type=float, default=0.2,
+                        help="Сила взаимодействия между скважинами (коэффициент)")
+    parser.add_argument('--shared_reservoir', action='store_true',
+                        help="Использовать общий резервуар для всех скважин")
     parser.add_argument('--initial_pressure', type=float, default=200.0,
                         help="Начальное давление в пласте (атм)")
     parser.add_argument('--initial_bhp', type=float, default=50.0,
                         help="Начальное забойное давление (атм)")
-    parser.add_argument('--productivity_index', type=float, default=0.1,
+    parser.add_argument('--productivity_index', type=float, default=0.5,
                         help="Индекс продуктивности (м³/сут/атм)")
+    parser.add_argument('--total_volume', type=float, default=10000.0,
+                        help="Общий объем пласта (м³)")
     parser.add_argument('--simulation_dt', type=float, default=1.0,
                         help="Шаг симуляции (дней)")
     parser.add_argument('--simulation_max_time', type=float, default=365.0,
@@ -108,6 +110,10 @@ def main():
     # Добавляем флаг общего резервуара, если нужно
     if args.shared_reservoir:
         cmd.append("--shared_reservoir")
+    
+    # Добавляем опцию дискретных действий, если указана
+    if args.use_discrete_actions:
+        cmd.append("--use_discrete_actions")
     
     # Добавляем имя запуска, если задано
     if args.run_name:

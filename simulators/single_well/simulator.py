@@ -25,6 +25,9 @@ class SingleWellSimulator:
         self.total_volume = total_volume # Используется для расчета падения давления
         self.dt = dt
         self.max_time = max_time
+        
+        # Добавляем поле для хранения последнего действия
+        self.last_action = None
 
         # Инициализация переменных состояния при создании экземпляра
         self.state = self.reset()
@@ -40,6 +43,11 @@ class SingleWellSimulator:
         self.flow_rate = 0.0
         self.cumulative_production = 0.0
         self.time = 0.0
+        
+        # Сбрасываем последнее действие
+        self.last_action = None
+        self.current_valve_opening = 0.0
+        
         # Возвращаем начальное состояние как numpy массив
         self.state = np.array([
             self.reservoir_pressure,
@@ -66,6 +74,9 @@ class SingleWellSimulator:
         # 1. Ограничиваем действие
         choke_opening = np.clip(action, 0.0, 1.0)
         self.current_valve_opening = choke_opening  # Сохраняем текущее открытие штуцера
+        
+        # Сохраняем последнее выполненное действие
+        self.last_action = choke_opening
 
         # 2. Рассчитываем дебит (упрощенная модель притока)
         # Учитываем, что давление в пласте не может быть ниже BHP

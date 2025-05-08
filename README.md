@@ -44,7 +44,7 @@ pip install -r requirements.txt
 To run training:
 
 ```bash
-python -m grpo.main --forecast_days 1 --simulation_max_time 4 --kl_weight 0.05 --lr 1e-5 --clip_eps 0.3 --gamma 0.99 --total_steps 1000 --rollouts_per_step 8 --train_batch_size 8 --temperature 0.7 --wandb
+python -m grpo.main --forecast_days 1 --simulation_max_time 4 --kl_weight 0.0 --lr 1e-5 --clip_eps 0.3 --gamma 0.99 --total_steps 1000 --rollouts_per_step 8 --train_batch_size 8 --temperature 0.7 --wandb --use_discrete_actions
 ```
 
 ### Main Parameters

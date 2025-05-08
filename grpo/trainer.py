@@ -32,6 +32,7 @@ from .replay_buffer import ReplayBuffer, Experience, join_experience_batch, zero
 # Импортируем новые модули
 from .parallel_simulator import ParallelSimulator, parallel_rollout
 from .grpo_advantage import process_episode_batch, calculate_discounted_returns, group_advantages
+from .utils import DISCRETE_ACTIONS, parse_llm_action, format_state, COLOR_RESET, COLOR_GREEN, COLOR_RED, COLOR_YELLOW, COLOR_BLUE, COLOR_CYAN
 
 import argparse
 from datetime import datetime
@@ -43,14 +44,18 @@ from tqdm import tqdm
 from simulators.multi_well.simulator import MultiWellSimulator
 from grpo.prompts import get_single_well_prompt, get_subsequent_step_prompt, get_first_step_prompt, BASE_PROMPT_TEMPLATE
 
-# --- Добавляем константы для цветов ---
-COLOR_RESET = "\033[0m"
-COLOR_GREEN = "\033[92m"
-COLOR_RED = "\033[91m"
-COLOR_YELLOW = "\033[93m"
-COLOR_BLUE = "\033[94m"
-COLOR_CYAN = "\033[96m"
+# --- Добавляем константы для цветов --- (больше не нужны, импортированы из utils)
+# COLOR_RESET = "\033[0m"
+# COLOR_GREEN = "\033[92m"
+# COLOR_RED = "\033[91m"
+# COLOR_YELLOW = "\033[93m"
+# COLOR_BLUE = "\033[94m"
+# COLOR_CYAN = "\033[96m"
 # --- Конец констант для цветов ---
+
+# --- Добавляем константу для дискретных действий --- (больше не нужна, импортирована из utils)
+# DISCRETE_ACTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+# --- Конец константы для дискретных действий ---
 
 
 class Logger:
@@ -294,7 +299,19 @@ def load_model(
 # Шаблон системного промпта (без подстановки значений)
 SYSTEM_PROMPT_TEMPLATE = """Ты - система управления нефтяной скважиной. 
 Твоя задача - максимизировать добычу нефти за весь период разработки месторождения.
-Ты будешь получать состояние скважины и должен выбрать степень открытия штуцера (от 0 до 1).
+Ты будешь получать состояние скважины и должен выбрать степень открытия штуцера, выбрав ОДИН из 10 вариантов.
+
+ДОСТУПНЫЕ ВАРИАНТЫ:
+1 - открытие штуцера на 0.1 (10%)
+2 - открытие штуцера на 0.2 (20%)
+3 - открытие штуцера на 0.3 (30%)
+4 - открытие штуцера на 0.4 (40%)
+5 - открытие штуцера на 0.5 (50%)
+6 - открытие штуцера на 0.6 (60%)
+7 - открытие штуцера на 0.7 (70%)
+8 - открытие штуцера на 0.8 (80%)
+9 - открытие штуцера на 0.9 (90%)
+10 - открытие штуцера на 1.0 (100%)
 
 Состояние скважины включает:
 - Давление в пласте (атм)
@@ -310,51 +327,51 @@ SYSTEM_PROMPT_TEMPLATE = """Ты - система управления нефт�
 {monthly_note}
 
 ПРАВИЛА ОТВЕТА:
-1. Ответ должен содержать ТОЛЬКО ОДНО ЧИСЛО от 0 до 1, обозначающее степень открытия штуцера.
+1. Ответ должен содержать ТОЛЬКО ОДНО ЧИСЛО от 1 до 10, обозначающее выбранный вариант степени открытия штуцера.
 2. НЕ ДОБАВЛЯЙ никаких объяснений, рассуждений или дополнительного текста.
-3. ТОЛЬКО ЧИСЛО и ничего больше.
+3. ТОЛЬКО ЧИСЛО от 1 до 10 и ничего больше.
 
 Примеры правильных ответов:
-0.75
-0.5
-0.25
 1
-0
-0.8
+5
+10
+7
+3
 
 Примеры НЕПРАВИЛЬНЫХ ответов:
-"Я выбираю степень открытия 0.5"
-"0.75, поскольку это оптимальное значение"
+"Я выбираю вариант 5"
+"Вариант 7, поскольку это оптимальное значение"
 "Степень открытия штуцера: 0.8"
-"Выбираю значение 0.6"
+"Выбираю значение 6"
 """
 
 # Первый системный промпт - только для рассуждения и вызова инструмента
-FIRST_STEP_PROMPT = """- Think about the reasoning process and explain it within <reasoning>...</reasoning> tags
-- Call the calculation tool using: <tool:calc>user asked question for calculation</tool>
+FIRST_STEP_PROMPT = """- Обдумай процесс рассуждения и объясни его в тегах <reasoning>...</reasoning>
+- Вызови инструмент для расчета, используя: <tool:calc>вопрос для расчета</tool>
 
-Here is the format example:
+Пример формата:
 
-Calculate 2 + 2
+Рассчитать 2 + 2
 
-<reasoning>I need to add these numbers together</reasoning>
+<reasoning>Мне нужно сложить эти числа</reasoning>
 <tool:calc>2 + 2</tool>
 
-Your task:
+Твоя задача:
 """
 
 # Второй системный промпт - только для ответа
-SECOND_STEP_PROMPT = """A conversation between User and Assistant. Now you need to copy answer from tool to answer tag.
+SECOND_STEP_PROMPT = """Диалог между Пользователем и Ассистентом. Теперь тебе нужно скопировать ответ из инструмента в тег ответа.
 
-- Your response MUST contain only the answer tag
-- After receiving the tool result, provide the final answer within <answer>...</answer> tags
+- Твой ответ ДОЛЖЕН содержать только тег ответа
+- После получения результата от инструмента, предоставь итоговый ответ в тегах <answer>...</answer>
+- Ответом должно быть ЧИСЛО от 1 до 10, соответствующее выбранному варианту степени открытия штуцера
 
-Format Example:
+Пример формата:
 
-Tool result: 4
+Результат инструмента: 4
 <answer>4</answer>
 
-Here is Tool output:
+Вот вывод инструмента:
 """
 
 @torch.no_grad()
@@ -602,7 +619,7 @@ def rollout(
         mask_end1 = max(0, end1 - 1)
         # Исправляем условие, чтобы не выходить за пределы маски
         if mask_end1 > mask_start1 and mask_start1 < action_mask.shape[1]:
-             actual_end1 = min(mask_end1, action_mask.shape[1]) # Убедимся, что не выходим за границу
+             actual_end1 = min(mask_end1, action_mask.shape[1])
              action_mask[i, mask_start1 : actual_end1] = True
 
         start2 = end1
@@ -719,7 +736,7 @@ def parse_args():
     # Аргументы Обучения
     parser.add_argument('--total_steps', type=int, default=1000, help='Total number of optimization steps')
     parser.add_argument('--epochs_per_step', type=int, default=1, help='Number of optimization epochs per collected batch')
-    parser.add_argument('--rollouts_per_step', type=int, default=32, help='Number of simulation episodes per global step') # Число эпизодов
+    parser.add_argument('--rollouts_per_step', type=int, default=32, help='Number of simulation episodes per global step')
     parser.add_argument('--train_batch_size', type=int, default=8, help='Batch size for training phase (experience buffer)') # Размер батча для SGD
     parser.add_argument('--max_buffer_size', type=int, default=0, help='Maximum replay buffer size (0 for unlimited)')
     parser.add_argument('--lr', type=float, default=1e-6, help='Learning rate')
@@ -735,6 +752,9 @@ def parse_args():
     parser.add_argument('--max_new_tokens_per_step', type=int, default=10, help='Max new tokens per simulation step (LLM action)')
     parser.add_argument('--temperature', type=float, default=0.7, help='Generation temperature')
     parser.add_argument('--top_p', type=float, default=1.0, help='Generation top_p')
+    
+    # Добавляем аргумент для дискретных действий
+    parser.add_argument('--use_discrete_actions', action='store_true', help='Use discrete actions (1-10) instead of continuous (0-1)')
 
     # Аргументы Симулятора - общие
     parser.add_argument('--multi_well', action='store_true', help='Use multi-well simulator instead of single well')
@@ -1007,134 +1027,6 @@ def rollout_simulator(
     
     return all_episodes_tokens, all_episodes_action_masks, all_episodes_rewards, all_episodes_stats
 
-def format_state(state, simulator):
-    """
-    Форматирует состояние симулятора для вывода в компактном виде.
-    """
-    # Проверяем тип симулятора (одна или несколько скважин)
-    if hasattr(simulator, 'well_names') and len(simulator.well_names) > 1:
-        # Для симулятора с несколькими скважинами
-        result = []
-        for i, well_name in enumerate(simulator.well_names):
-            start_idx = i * simulator.state_dim_per_well
-            # Извлекаем параметры для текущей скважины
-            reservoir_pressure = state[start_idx]
-            bhp = state[start_idx + 1]
-            production = state[start_idx + 2]
-            time = state[start_idx + 3]
-            
-            well_info = f"Скв.{well_name}: P={reservoir_pressure:.1f}атм, P_заб={bhp:.1f}атм, V={production:.1f}м³, t={time:.1f}д"
-            
-            # Добавляем информацию о текущем дебите
-            if hasattr(simulator, 'current_rates') and i < len(simulator.current_rates):
-                well_info += f", Q={simulator.current_rates[i]:.1f}м³/сут"
-            
-            result.append(well_info)
-        
-        return "\n".join(result)
-    else:
-        # Для симулятора с одной скважиной
-        reservoir_pressure = state[0]
-        bhp = state[1]
-        production = state[2]
-        time = state[3]
-        
-        result = f"P={reservoir_pressure:.1f}атм, P_заб={bhp:.1f}атм, V={production:.1f}м³, t={time:.1f}д"
-        
-        # Добавляем информацию о текущем дебите
-        if hasattr(simulator, 'current_rate'):
-            result += f", Q={simulator.current_rate:.1f}м³/сут"
-        
-        # Добавляем информацию о максимальном времени симуляции
-        if hasattr(simulator, 'max_time'):
-            remaining_time = simulator.max_time - time
-            result += f", ост.время={remaining_time:.1f}д"
-        
-        return result
-
-def parse_llm_action(response: str) -> Tuple[Optional[float], Dict[str, float]]:
-    """
-    Extracts action values from the LLM response.
-    
-    Args:
-        response (str): The LLM response text.
-        
-    Returns:
-        Tuple[Optional[float], Dict[str, float]]: A tuple containing the extracted action value (between 0 and 1 or None if format invalid)
-        and a dictionary of format rewards.
-    """
-    try:
-        # Clean up the response
-        clean_response = response.strip()
-        
-        # If response is empty, return None to indicate invalid format
-        if not clean_response:
-            print(f"Пустой ответ: действие не будет выполнено")
-            return None, {"empty_response": -1.0}
-        
-        # Проверяем правильный формат <parameter>число</parameter>
-        perfect_pattern = r'<parameter>(.*?)</parameter>'
-        perfect_match = re.search(perfect_pattern, clean_response, re.DOTALL)
-        
-        if perfect_match:
-            # Extract the value inside the tags
-            value_str = perfect_match.group(1).strip()
-            try:
-                value = float(value_str)
-                # Limit the range
-                value = max(0.0, min(1.0, value))
-                # Идеальный формат, максимальная награда
-                return value, {"parameter_format": 1.0}
-            except ValueError:
-                # If the content inside tags is not a number, use default and give negative reward
-                print(f"Ошибка формата: тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                return None, {"parameter_not_number": -1.0}
-        
-        # Более гибкий паттерн для случаев с незакрытыми тегами
-        flexible_pattern = r'<parameter>(.*?)(?:</parameter|</parameter>|$)'
-        flexible_match = re.search(flexible_pattern, clean_response, re.DOTALL)
-        
-        if flexible_match:
-            # Extract the value inside the tags
-            value_str = flexible_match.group(1).strip()
-            try:
-                value = float(value_str)
-                # Limit the range
-                value = max(0.0, min(1.0, value))
-                # Почти правильный формат, положительная но не максимальная награда
-                print(f"Неполный формат тегов: {clean_response}. Действие будет выполнено, но в следующий раз используйте корректный формат.")
-                return value, {"almost_parameter_format": 0.6}
-            except ValueError:
-                # If the content inside tags is not a number, use default and give negative reward
-                print(f"Ошибка формата: неполный тег <parameter> содержит не число: '{value_str}'. Действие не будет выполнено.")
-                return None, {"parameter_not_number": -1.0}
-        
-        # Ищем число в тексте для использования как значение (но даем отрицательную награду)
-        number_pattern = r'(?:^|[^\w])(\d+(?:\.\d+)?)(?:[^\w]|$)'
-        number_match = re.search(number_pattern, clean_response)
-        if number_match:
-            print(f"Найдено число без правильного формата: {clean_response}. Действие не будет выполнено, используйте формат <parameter>число</parameter>.")
-            return None, {"wrong_format_with_number": -0.8}
-        
-        # Check for explicit cases of full opening/closing for value extraction
-        if any(phrase in clean_response.lower() for phrase in ["fully open", "maximum open", "completely open", "полностью открыть"]):
-            print(f"Найдена фраза о полном открытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>1.0</parameter>")
-            return None, {"wrong_format_open": -0.8}
-        elif any(phrase in clean_response.lower() for phrase in ["fully close", "completely close", "close the choke", "полностью закрыть"]):
-            print(f"Найдена фраза о полном закрытии, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.0</parameter>")
-            return None, {"wrong_format_close": -0.8}
-        elif any(phrase in clean_response.lower() for phrase in ["no change", "maintain", "keep", "без изменений", "сохранить"]):
-            print(f"Найдена фраза о сохранении текущего состояния, но формат неверный. Действие не будет выполнено. Используйте <parameter>0.5</parameter>")
-            return None, {"wrong_format_maintain": -0.8}
-        
-        # If unable to extract a value, use the default
-        print(f"Не удалось извлечь значение из ответа: '{clean_response}'. Действие не будет выполнено.")
-        return None, {"wrong_format_default": -1.0}
-    except Exception as e:
-        # In case of any error, return None to indicate invalid format
-        print(f"Ошибка при обработке ответа: {str(e)}. Действие не будет выполнено.")
-        return None, {"error": -1.0}
-
 def calculate_discounted_returns(rewards, gamma=0.99):
     """
     Вычисляет дисконтированные возвраты для последовательности наград.
@@ -1161,7 +1053,20 @@ def calculate_discounted_returns(rewards, gamma=0.99):
 
 def main():
     args = parse_args()
-
+    
+    # Устанавливаем случайные зерна для воспроизводимости
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    
+    # Выводим информацию об использовании дискретных действий
+    if args.use_discrete_actions:
+        print(f"{COLOR_GREEN}Используем дискретные действия (варианты 1-10){COLOR_RESET}")
+        print(f"Значения действий: {DISCRETE_ACTIONS}")
+    else:
+        print(f"{COLOR_YELLOW}Используем непрерывные действия (значения от 0 до 1){COLOR_RESET}")
+    
     # --- Инициализация ---
     seed = args.seed
     device_index = args.device_index
@@ -1223,12 +1128,12 @@ def main():
     reference_model.eval()
     # Проверяем, есть ли градиент чекпоинтинг, прежде чем включать
     if hasattr(model, "gradient_checkpointing_enable"):
-         model.gradient_checkpointing_enable(
-             gradient_checkpointing_kwargs={"use_reentrant": False}
-         )
-         print("Gradient checkpointing enabled.")
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("Gradient checkpointing enabled.")
     else:
-         print(f"{COLOR_YELLOW}Warning: Model does not support gradient_checkpointing_enable directly.{COLOR_RESET}")
+        print(f"{COLOR_YELLOW}Warning: Model does not support gradient_checkpointing_enable directly.{COLOR_RESET}")
 
     pad_token_id = tokenizer.eos_token_id
 
@@ -1406,11 +1311,6 @@ def main():
         # Проверяем, что были собраны эпизоды
         # Преобразуем списки в тензоры
         if "logits" not in model_batch_data or not model_batch_data["logits"]:
-            print(f"{COLOR_RED}Не удалось собрать ни одного эпизода. Пропускаем шаг обучения.{COLOR_RESET}")
-            # Увеличиваем счетчик глобальных шагов и продолжаем
-            global_step += 1
-            continue
-
             print(f"{COLOR_RED}Не удалось собрать ни одного эпизода. Пропускаем шаг обучения.{COLOR_RESET}")
             # Увеличиваем счетчик глобальных шагов и продолжаем
             global_step += 1
