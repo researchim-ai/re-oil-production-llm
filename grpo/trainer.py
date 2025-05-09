@@ -607,7 +607,17 @@ def parse_args():
     parser.add_argument('--interaction_strength', type=float, default=0.1, help='Strength of interaction between wells (0-1)')
     parser.add_argument('--shared_reservoir', action='store_true', help='Use shared reservoir in multi-well simulator')
 
+    # Аргументы для логирования
     parser.add_argument('--log_completions_interval', type=int, default=10, help='Log example episode rollout every N global steps')
+    
+    # Аргументы для случайного начального состояния
+    parser.add_argument('--use_random_states', action='store_true', help='Use random initial states for training')
+    parser.add_argument('--random_state_min_depletion', type=float, default=0.0, help='Minimum depletion ratio for random states (0-1)')
+    parser.add_argument('--random_state_max_depletion', type=float, default=0.8, help='Maximum depletion ratio for random states (0-1)')
+    parser.add_argument('--random_state_probability', type=float, default=0.7, 
+                      help='Probability of using random states in each global step (0-1). 0=never, 1=always')
+    parser.add_argument('--use_realistic_ranges', action='store_true', default=True,
+                      help='Use realistic parameter constraints for random states')
 
     args = parser.parse_args()
 
@@ -788,13 +798,27 @@ def main():
         )
         
         # Выполняем параллельные роллауты
+        # Определяем, использовать ли случайные состояния на этом шаге, на основе заданной вероятности
+        use_random_on_this_step = args.use_random_states and random.random() < args.random_state_probability
+        
+        if use_random_on_this_step:
+            print(f"{COLOR_CYAN}Шаг {global_step}: Используем случайные начальные состояния "
+                 f"(истощение {args.random_state_min_depletion:.2f}-{args.random_state_max_depletion:.2f}){COLOR_RESET}")
+        else:
+            print(f"{COLOR_CYAN}Шаг {global_step}: Используем начальные состояния скважин{COLOR_RESET}")
+        
         episode_tokens, action_masks, rewards, episode_stats = parallel_rollout(
             model=model,
             tokenizer=tokenizer,
             parallel_sim=parallel_sim,
             n_steps=int(args.simulation_max_time / args.simulation_dt),  # Максимальное количество шагов
             temperature=temperature,
-            verbose=True
+            top_p=top_p,
+            verbose=True,
+            use_random_states=use_random_on_this_step,
+            random_state_min_depletion=args.random_state_min_depletion,
+            random_state_max_depletion=args.random_state_max_depletion,
+            use_realistic_ranges=args.use_realistic_ranges
         )
         
         # Обрабатываем результаты и создаем буфер опыта
@@ -887,7 +911,36 @@ def main():
             global_step += 1
             continue
         
-        # Преобразуем списки в тензоры
+        # Проверяем и выравниваем размеры тензоров перед стекированием
+        # Определяем максимальную длину последовательности в батче
+        max_seq_length = max([logits.shape[0] for logits in model_batch_data["logits"]])
+        
+        # Выравниваем размеры тензоров с помощью паддинга
+        for i in range(len(model_batch_data["logits"])):
+            current_length = model_batch_data["logits"][i].shape[0]
+            if current_length < max_seq_length:
+                # Паддинг для логитов модели
+                padding_size = max_seq_length - current_length
+                padding = torch.zeros(padding_size, model_batch_data["logits"][i].shape[1], 
+                                     device=model_batch_data["logits"][i].device)
+                model_batch_data["logits"][i] = torch.cat([model_batch_data["logits"][i], padding], dim=0)
+                
+                # Паддинг для последовательностей
+                seq_padding = torch.zeros(padding_size, device=model_batch_data["sequences"][i].device, 
+                                        dtype=model_batch_data["sequences"][i].dtype)
+                model_batch_data["sequences"][i] = torch.cat([model_batch_data["sequences"][i], seq_padding], dim=0)
+                
+                # Паддинг для масок действий
+                mask_padding = torch.zeros(padding_size, device=model_batch_data["action_masks"][i].device, 
+                                         dtype=model_batch_data["action_masks"][i].dtype)
+                model_batch_data["action_masks"][i] = torch.cat([model_batch_data["action_masks"][i], mask_padding], dim=0)
+                
+                # Паддинг для логитов референсной модели
+                ref_padding = torch.zeros(padding_size, ref_batch_data["logits"][i].shape[1], 
+                                        device=ref_batch_data["logits"][i].device)
+                ref_batch_data["logits"][i] = torch.cat([ref_batch_data["logits"][i], ref_padding], dim=0)
+        
+        # Теперь стекируем выровненные тензоры
         model_batch_data["logits"] = torch.stack(model_batch_data["logits"])
         model_batch_data["sequences"] = torch.stack(model_batch_data["sequences"])
         model_batch_data["action_masks"] = torch.stack(model_batch_data["action_masks"])

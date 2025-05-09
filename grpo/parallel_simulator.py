@@ -4,6 +4,7 @@ import torch
 import re
 import time
 import numpy as np
+import random
 from typing import List, Tuple, Dict, Optional, Any, Union
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, GenerationConfig
 from simulators.single_well.simulator import SingleWellSimulator
@@ -74,10 +75,82 @@ class ParallelSimulator:
         
         return self.current_states
     
+    def reset_all_to_random_state(self, min_depletion: float = 0.0, max_depletion: float = 0.9,
+                                use_realistic_ranges: bool = True):
+        """
+        Сбрасывает все симуляторы к случайным промежуточным состояниям.
+        
+        ВАЖНО: Этот метод следует вызывать только в начале эпизода, а не на каждом шаге,
+        чтобы модель могла изучать последовательность взаимосвязанных действий в рамках
+        одного эпизода разработки скважины.
+        
+        Args:
+            min_depletion (float): Минимальное значение степени истощения (0.0 = начало разработки)
+            max_depletion (float): Максимальное значение степени истощения (1.0 = полное истощение)
+            use_realistic_ranges (bool): Использовать ли реалистичные ограничения для параметров
+            
+        Returns:
+            List[np.ndarray]: Список случайных начальных состояний для всех симуляторов
+        """
+        for i, simulator in enumerate(self.simulators):
+            # Проверяем, поддерживает ли симулятор метод reset_to_random_state
+            if hasattr(simulator, 'reset_to_random_state'):
+                # Для каждого симулятора устанавливаем свой диапазон истощения
+                # Это создаст разнообразие в тренировочных данных
+                individual_min = max(0.0, min_depletion + random.uniform(-0.1, 0.1))
+                individual_max = min(0.95, max_depletion + random.uniform(-0.1, 0.1))
+                
+                # Гарантируем, что min < max
+                if individual_min >= individual_max:
+                    individual_min = max(0.0, individual_max - 0.1)
+                
+                self.current_states[i] = simulator.reset_to_random_state(
+                    min_depletion=individual_min,
+                    max_depletion=individual_max,
+                    use_realistic_ranges=use_realistic_ranges
+                )
+            else:
+                # Если симулятор не поддерживает случайное состояние, используем обычный сброс
+                self.current_states[i] = simulator.reset()
+        
+        return self.current_states
+    
     def reset_simulator(self, index: int):
         """Сбрасывает конкретный симулятор по индексу."""
         if 0 <= index < self.n_simulators:
             self.current_states[index] = self.simulators[index].reset()
+            return self.current_states[index]
+        else:
+            raise IndexError(f"Индекс {index} выходит за пределы диапазона симуляторов (0-{self.n_simulators-1})")
+    
+    def reset_simulator_to_random_state(self, index: int, min_depletion: float = 0.0, max_depletion: float = 0.9,
+                                      use_realistic_ranges: bool = True):
+        """
+        Сбрасывает конкретный симулятор к случайному промежуточному состоянию.
+        
+        Args:
+            index (int): Индекс симулятора для сброса
+            min_depletion (float): Минимальное значение степени истощения
+            max_depletion (float): Максимальное значение степени истощения
+            use_realistic_ranges (bool): Использовать ли реалистичные ограничения для параметров
+            
+        Returns:
+            np.ndarray: Случайное начальное состояние для указанного симулятора
+        """
+        if 0 <= index < self.n_simulators:
+            simulator = self.simulators[index]
+            
+            # Проверяем, поддерживает ли симулятор метод reset_to_random_state
+            if hasattr(simulator, 'reset_to_random_state'):
+                self.current_states[index] = simulator.reset_to_random_state(
+                    min_depletion=min_depletion,
+                    max_depletion=max_depletion,
+                    use_realistic_ranges=use_realistic_ranges
+                )
+            else:
+                # Если симулятор не поддерживает случайное состояние, используем обычный сброс
+                self.current_states[index] = simulator.reset()
+                
             return self.current_states[index]
         else:
             raise IndexError(f"Индекс {index} выходит за пределы диапазона симуляторов (0-{self.n_simulators-1})")
@@ -220,6 +293,10 @@ def parallel_rollout(
     temperature: float = 0.7,
     top_p: float = 0.95,
     verbose: bool = True,
+    use_random_states: bool = False,
+    random_state_min_depletion: float = 0.0,
+    random_state_max_depletion: float = 0.9,
+    use_realistic_ranges: bool = True,
 ) -> Tuple[
     List[torch.Tensor],   # all_episode_tokens
     List[torch.Tensor],   # all_action_masks
@@ -237,6 +314,10 @@ def parallel_rollout(
         temperature: Температура генерации
         top_p: Параметр top_p для генерации
         verbose: Выводить ли информацию в консоль
+        use_random_states: Использовать ли случайные начальные состояния для симуляторов
+        random_state_min_depletion: Минимальная степень истощения для случайных состояний
+        random_state_max_depletion: Максимальная степень истощения для случайных состояний
+        use_realistic_ranges: Использовать ли реалистичные ограничения для параметров
     
     Returns:
         Кортеж из:
@@ -274,6 +355,22 @@ def parallel_rollout(
     episode_format_rewards_list = [[] for _ in range(n_simulators)]  # Добавляем список для хранения формата наград
     
     start_time = time.time()
+    
+    # Сбрасываем все симуляторы в начальное состояние (обычное или случайное)
+    if use_random_states:
+        if verbose:
+            print(f"{COLOR_CYAN}Используем случайные начальные состояния "
+                  f"(диапазон истощения: {random_state_min_depletion:.2f}-{random_state_max_depletion:.2f}, "
+                  f"реалистичные диапазоны: {'Да' if use_realistic_ranges else 'Нет'}){COLOR_RESET}")
+        parallel_sim.reset_all_to_random_state(
+            min_depletion=random_state_min_depletion,
+            max_depletion=random_state_max_depletion,
+            use_realistic_ranges=use_realistic_ranges
+        )
+    else:
+        if verbose:
+            print(f"{COLOR_CYAN}Используем начальное состояние скважин{COLOR_RESET}")
+        parallel_sim.reset_all()
     
     # Создаем конфигурацию генерации
     generation_config = GenerationConfig(

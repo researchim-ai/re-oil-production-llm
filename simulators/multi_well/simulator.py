@@ -1,4 +1,5 @@
 import numpy as np
+import random
 from simulators.single_well.simulator import SingleWellSimulator
 
 class MultiWellSimulator:
@@ -46,6 +47,10 @@ class MultiWellSimulator:
             # При независимых резервуарах объем делится между скважинами
             well_volume = total_volume / n_wells
         
+        # Сохраняем параметры для будущего использования
+        self.well_params = well_params.copy()
+        self.well_volume = well_volume
+        
         # Создаем симуляторы для каждой скважины
         self.simulators = []
         for i in range(n_wells):
@@ -76,6 +81,169 @@ class MultiWellSimulator:
         # Объединяем все состояния в один вектор
         self.state = np.concatenate(states)
         
+        return self.state
+        
+    def reset_to_random_state(self, min_depletion: float = 0.0, max_depletion: float = 0.9,
+                               use_realistic_ranges: bool = True) -> np.ndarray:
+        """
+        Сбрасывает симулятор к случайному промежуточному состоянию разработки группы скважин.
+        
+        Args:
+            min_depletion (float): Минимальное значение степени истощения (0.0 = начало разработки)
+            max_depletion (float): Максимальное значение степени истощения (1.0 = полное истощение)
+            use_realistic_ranges (bool): Использовать ли реалистичные ограничения для параметров
+            
+        Returns:
+            np.ndarray: Случайное промежуточное состояние
+        """
+        # Сначала сбрасываем в начальное состояние, чтобы корректно проинициализировать все переменные
+        self.reset()
+        
+        # Ограничиваем максимальную степень истощения для реалистичности
+        if use_realistic_ranges:
+            # Обычно месторождение не добывается до полного истощения из-за экономических ограничений
+            realistic_max_depletion = min(max_depletion, 0.85)  # Не более 85% от общего объема
+            # В начале разработки обычно уже есть минимальный отбор для тестирования
+            realistic_min_depletion = max(min_depletion, 0.01)  # Минимум 1% от общего объема
+            
+            # Используем ограниченные диапазоны
+            min_depletion = realistic_min_depletion
+            max_depletion = realistic_max_depletion
+        
+        # В многоскважинной системе скважины обычно имеют разную степень истощения
+        # Выбираем общую степень истощения для всего месторождения
+        field_depletion_ratio = random.uniform(min_depletion, max_depletion)
+        
+        # Накопленная добыча и время для всего месторождения
+        total_field_production = field_depletion_ratio * self.total_volume
+        
+        # Рассчитываем время разработки для всего месторождения
+        if use_realistic_ranges:
+            # Нелинейная зависимость времени от степени истощения
+            base_time = self.max_time * (field_depletion_ratio**0.9)
+            time_variation = 0.12 * base_time  # 12% вариации
+            field_time = min(self.max_time - self.dt, max(0, base_time + random.uniform(-time_variation, time_variation)))
+        else:
+            # Линейная зависимость
+            field_time = field_depletion_ratio * self.max_time
+        
+        # Расчет пластового давления для общего месторождения
+        if self.shared_reservoir:
+            if use_realistic_ranges:
+                # Нелинейное падение давления для общего резервуара
+                pressure_factor = 1.0 - field_depletion_ratio**0.85
+                pressure_variation = random.uniform(-0.03, 0.03)  # ±3% вариации
+                field_pressure = self.initial_reservoir_pressure * max(0, min(1, pressure_factor + pressure_variation))
+            else:
+                # Линейное падение давления
+                field_pressure = self.initial_reservoir_pressure * (1.0 - field_depletion_ratio)
+            
+            # Применяем одинаковое давление ко всем скважинам при общем резервуаре
+            for i in range(self.n_wells):
+                self.reservoir_pressures[i] = field_pressure
+        
+        # Распределяем добычу между скважинами
+        remaining_production = total_field_production
+        
+        # Первый проход: распределяем добычу между скважинами
+        well_production_ratios = []
+        
+        if use_realistic_ranges:
+            # В реальности скважины имеют разные объемы добычи
+            # Используем распределение, где некоторые скважины добывают больше других
+            for i in range(self.n_wells):
+                if i == self.n_wells - 1:
+                    # Последняя скважина получает оставшуюся долю
+                    well_production_ratios.append(1.0 - sum(well_production_ratios))
+                else:
+                    # Генерируем случайную долю, но с учетом оставшихся скважин
+                    remaining_wells = self.n_wells - i
+                    max_share = (1.0 - sum(well_production_ratios)) / remaining_wells * 2
+                    min_share = max(0, (1.0 - sum(well_production_ratios)) / remaining_wells * 0.5)
+                    well_production_ratios.append(random.uniform(min_share, max_share))
+        else:
+            # Равномерное распределение с небольшой случайностью
+            for i in range(self.n_wells):
+                if i == self.n_wells - 1:
+                    # Последняя скважина получает оставшуюся долю
+                    well_production_ratios.append(1.0 - sum(well_production_ratios))
+                else:
+                    well_production_ratios.append(random.uniform(0.0, 1.0 / self.n_wells * 1.5))
+        
+        # Нормализуем доли, чтобы сумма была равна 1
+        total_ratio = sum(well_production_ratios)
+        well_production_ratios = [ratio / total_ratio for ratio in well_production_ratios]
+        
+        # Применяем распределение к скважинам
+        for i in range(self.n_wells):
+            # Рассчитываем добычу для конкретной скважины
+            self.cumulative_productions[i] = total_field_production * well_production_ratios[i]
+            
+            # Устанавливаем время для всех скважин одинаковое
+            self.times[i] = field_time
+            
+            # Для независимых резервуаров рассчитываем давление индивидуально
+            if not self.shared_reservoir:
+                # Индивидуальное истощение для этой скважины
+                well_depletion = self.cumulative_productions[i] / (self.total_volume / self.n_wells)
+                
+                if use_realistic_ranges:
+                    # Нелинейное падение давления
+                    pressure_factor = 1.0 - well_depletion**0.85
+                    pressure_variation = random.uniform(-0.05, 0.05)  # ±5% вариации
+                    self.reservoir_pressures[i] = self.initial_reservoir_pressure * max(0, min(1, pressure_factor + pressure_variation))
+                else:
+                    # Линейное падение давления
+                    self.reservoir_pressures[i] = self.initial_reservoir_pressure * (1.0 - well_depletion)
+            
+            # Генерируем случайное последнее действие для каждой скважины
+            if use_realistic_ranges:
+                # В зависимости от индивидуального истощения скважины
+                well_depletion = self.cumulative_productions[i] / (self.total_volume / self.n_wells)
+                
+                if well_depletion < 0.3:
+                    # Начальная стадия разработки
+                    last_action = random.uniform(0.7, 1.0)
+                elif well_depletion < 0.7:
+                    # Средняя стадия разработки
+                    last_action = random.uniform(0.4, 0.8)
+                else:
+                    # Поздняя стадия разработки
+                    last_action = random.uniform(0.1, 0.5)
+            else:
+                # Полностью случайное значение
+                last_action = random.uniform(0.0, 1.0)
+            
+            self.last_actions[i] = last_action
+            self.valve_openings[i] = last_action
+            
+            # Рассчитываем текущий дебит для скважины
+            delta_p = max(0.0, self.reservoir_pressures[i] - self.bhp)
+            self.current_rates[i] = self.productivity_index * delta_p * last_action
+            
+            # Обратное влияние других скважин при наличии взаимодействия
+            if self.interaction_strength > 0:
+                for j in range(self.n_wells):
+                    if i != j:
+                        # Влияние j-й скважины на i-ю
+                        self.current_rates[i] -= self.interaction_strength * self.productivity_index * \
+                                               delta_p * self.valve_openings[j] / self.n_wells
+                
+                # Гарантируем, что дебит не отрицательный
+                self.current_rates[i] = max(0.0, self.current_rates[i])
+        
+        # Формируем состояние как вектор
+        state = []
+        for i in range(self.n_wells):
+            well_state = [
+                self.reservoir_pressures[i],
+                self.current_rates[i],
+                self.cumulative_productions[i],
+                self.times[i]
+            ]
+            state.extend(well_state)
+        
+        self.state = np.array(state)
         return self.state
     
     def step(self, actions: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
