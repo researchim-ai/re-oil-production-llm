@@ -11,6 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 from typing import Dict, List, Tuple, Optional, Union, Any
+from datetime import datetime
 
 # Импортируем симуляторы
 from simulators.single_well.simulator import SingleWellSimulator
@@ -468,6 +469,31 @@ def generate_dataset(
     # Генерируем примеры
     print(f"{COLOR_BLUE}Генерация {num_samples} примеров для {simulator_type}...{COLOR_RESET}")
     
+    # Создаем путь к директории datasets и добавляем временную метку к имени файла
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Проверяем, включает ли путь уже директорию datasets
+    if not output_file.startswith('datasets/'):
+        # Если путь не содержит директорию datasets, добавляем её
+        # Также проверяем, является ли путь просто именем файла или полным путем
+        base_filename = os.path.basename(output_file)
+        name_without_ext, ext = os.path.splitext(base_filename)
+        if not ext:  # Если расширение не указано, добавляем .json
+            ext = '.json'
+        # Формируем новое имя файла с временной меткой
+        new_filename = f"{name_without_ext}_{timestamp}{ext}"
+        output_file = os.path.join('datasets', new_filename)
+    else:
+        # Если путь уже содержит datasets, просто добавляем временную метку перед расширением
+        dirname = os.path.dirname(output_file)
+        basename = os.path.basename(output_file)
+        name_without_ext, ext = os.path.splitext(basename)
+        if not ext:  # Если расширение не указано, добавляем .json
+            ext = '.json'
+        # Формируем новое имя файла с временной меткой
+        new_filename = f"{name_without_ext}_{timestamp}{ext}"
+        output_file = os.path.join(dirname, new_filename)
+    
     # Создаем директорию, если её нет
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,7 +540,8 @@ def generate_dataset(
             'metadata': {
                 'simulator_type': simulator_type,
                 'forecast_days': forecast_days,
-                'simulation_steps': simulation_steps
+                'simulation_steps': simulation_steps,
+                'created_at': timestamp
             }
         }
         
@@ -561,6 +588,9 @@ def generate_dataset(
     df.to_csv(csv_file, index=False)
     
     print(f"CSV-версия сохранена: {csv_file}")
+    
+    # Возвращаем путь к созданному файлу для удобства
+    return output_file
 
 
 def parse_args():
@@ -568,7 +598,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Генерация датасетов для обучения LLM управлению нефтяными скважинами')
     
     # Основные параметры
-    parser.add_argument('--output', type=str, required=True, help='Путь к файлу для сохранения датасета')
+    parser.add_argument('--output', type=str, required=True, help='Имя файла для сохранения датасета (будет сохранен в директории datasets/)')
     parser.add_argument('--num_samples', type=int, default=1000, help='Количество генерируемых примеров')
     parser.add_argument('--simulator_type', type=str, choices=['single_well', 'multi_well'], default='single_well',
                       help='Тип симулятора (одиночная или несколько скважин)')
@@ -625,7 +655,7 @@ def main():
         })
     
     # Генерируем датасет
-    generate_dataset(
+    output_path = generate_dataset(
         output_file=args.output,
         num_samples=args.num_samples,
         simulator_type=args.simulator_type,
@@ -637,6 +667,8 @@ def main():
         verbose=args.verbose,
         **simulator_params
     )
+    
+    print(f"Датасет доступен по пути: {output_path}")
 
 
 if __name__ == "__main__":

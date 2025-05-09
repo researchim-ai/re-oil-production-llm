@@ -36,6 +36,26 @@ class MultiWellSimulator:
         self.shared_reservoir = shared_reservoir
         self.total_volume = total_volume
         
+        # Сохраняем параметры скважин
+        self.initial_reservoir_pressure = well_params.get('initial_reservoir_pressure', 200.0)
+        self.bhp = well_params.get('initial_bhp', 50.0)
+        self.pi = well_params.get('productivity_index', 0.1)
+        self.dt = well_params.get('dt', 1.0)
+        self.max_time = well_params.get('max_time', 365.0)
+        
+        # Инициализация атрибутов для отслеживания состояния симуляции
+        self.time = 0.0
+        self.cumulative_production = 0.0
+        self.current_rates = np.zeros(n_wells)
+        self.current_valve_openings = np.zeros(n_wells)
+        self.reservoir_pressures = np.ones(n_wells) * self.initial_reservoir_pressure
+        self.cumulative_productions = np.zeros(n_wells)
+        self.times = np.zeros(n_wells)
+        self.valve_openings = np.zeros(n_wells)
+        
+        # Количество элементов в состоянии одной скважины
+        self.state_dim_per_well = 4  # [reservoir_pressure, flow_rate, cumulative_production, time]
+        
         # Добавляем сохранение последних действий
         self.last_actions = [None] * n_wells
         
@@ -74,6 +94,16 @@ class MultiWellSimulator:
         """
         # Сбрасываем состояние каждой скважины
         states = [sim.reset() for sim in self.simulators]
+        
+        # Сбрасываем общие атрибуты симуляции
+        self.time = 0.0
+        self.cumulative_production = 0.0
+        self.current_rates = np.zeros(self.n_wells)
+        self.current_valve_openings = np.zeros(self.n_wells)
+        self.reservoir_pressures = np.ones(self.n_wells) * self.initial_reservoir_pressure
+        self.cumulative_productions = np.zeros(self.n_wells)
+        self.times = np.zeros(self.n_wells)
+        self.valve_openings = np.zeros(self.n_wells)
         
         # Сбрасываем последние действия
         self.last_actions = [None] * self.n_wells
@@ -116,6 +146,7 @@ class MultiWellSimulator:
         
         # Накопленная добыча и время для всего месторождения
         total_field_production = field_depletion_ratio * self.total_volume
+        self.cumulative_production = total_field_production
         
         # Рассчитываем время разработки для всего месторождения
         if use_realistic_ranges:
@@ -126,6 +157,9 @@ class MultiWellSimulator:
         else:
             # Линейная зависимость
             field_time = field_depletion_ratio * self.max_time
+        
+        # Устанавливаем текущее время
+        self.time = field_time
         
         # Расчет пластового давления для общего месторождения
         if self.shared_reservoir:
@@ -143,9 +177,6 @@ class MultiWellSimulator:
                 self.reservoir_pressures[i] = field_pressure
         
         # Распределяем добычу между скважинами
-        remaining_production = total_field_production
-        
-        # Первый проход: распределяем добычу между скважинами
         well_production_ratios = []
         
         if use_realistic_ranges:
@@ -174,10 +205,14 @@ class MultiWellSimulator:
         total_ratio = sum(well_production_ratios)
         well_production_ratios = [ratio / total_ratio for ratio in well_production_ratios]
         
+        # Формируем вектор состояния
+        states = []
+        
         # Применяем распределение к скважинам
         for i in range(self.n_wells):
             # Рассчитываем добычу для конкретной скважины
-            self.cumulative_productions[i] = total_field_production * well_production_ratios[i]
+            well_production = total_field_production * well_production_ratios[i]
+            self.cumulative_productions[i] = well_production
             
             # Устанавливаем время для всех скважин одинаковое
             self.times[i] = field_time
@@ -185,7 +220,8 @@ class MultiWellSimulator:
             # Для независимых резервуаров рассчитываем давление индивидуально
             if not self.shared_reservoir:
                 # Индивидуальное истощение для этой скважины
-                well_depletion = self.cumulative_productions[i] / (self.total_volume / self.n_wells)
+                well_volume = self.total_volume / self.n_wells
+                well_depletion = well_production / well_volume
                 
                 if use_realistic_ranges:
                     # Нелинейное падение давления
@@ -199,7 +235,8 @@ class MultiWellSimulator:
             # Генерируем случайное последнее действие для каждой скважины
             if use_realistic_ranges:
                 # В зависимости от индивидуального истощения скважины
-                well_depletion = self.cumulative_productions[i] / (self.total_volume / self.n_wells)
+                well_volume = self.total_volume / self.n_wells 
+                well_depletion = self.cumulative_productions[i] / well_volume
                 
                 if well_depletion < 0.3:
                     # Начальная стадия разработки
@@ -219,31 +256,34 @@ class MultiWellSimulator:
             
             # Рассчитываем текущий дебит для скважины
             delta_p = max(0.0, self.reservoir_pressures[i] - self.bhp)
-            self.current_rates[i] = self.productivity_index * delta_p * last_action
+            current_rate = self.pi * delta_p * last_action
             
             # Обратное влияние других скважин при наличии взаимодействия
             if self.interaction_strength > 0:
                 for j in range(self.n_wells):
                     if i != j:
-                        # Влияние j-й скважины на i-ю
-                        self.current_rates[i] -= self.interaction_strength * self.productivity_index * \
-                                               delta_p * self.valve_openings[j] / self.n_wells
+                        # Влияние j-й скважины на i-ю через дебит
+                        j_delta_p = max(0.0, self.reservoir_pressures[j] - self.bhp)
+                        j_rate = self.pi * j_delta_p * self.valve_openings[j]
+                        # Уменьшаем дебит i-й скважины пропорционально активности j-й
+                        current_rate -= self.interaction_strength * j_rate / (self.n_wells - 1)
                 
                 # Гарантируем, что дебит не отрицательный
-                self.current_rates[i] = max(0.0, self.current_rates[i])
-        
-        # Формируем состояние как вектор
-        state = []
-        for i in range(self.n_wells):
+                current_rate = max(0.0, current_rate)
+            
+            self.current_rates[i] = current_rate
+            
+            # Создаем состояние для скважины
             well_state = [
                 self.reservoir_pressures[i],
-                self.current_rates[i],
+                current_rate,
                 self.cumulative_productions[i],
-                self.times[i]
+                field_time
             ]
-            state.extend(well_state)
+            states.extend(well_state)
         
-        self.state = np.array(state)
+        # Сохраняем состояние
+        self.state = np.array(states)
         return self.state
     
     def step(self, actions: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
@@ -296,11 +336,23 @@ class MultiWellSimulator:
             # Получаем текущие данные для скважины
             start_idx = i * self.state_dim_per_well
             well_res_pressure = self.state[start_idx]
-            well_bhp = self.state[start_idx + 1]
             
             # Рассчитываем дебит для скважины
-            delta_p = max(0.0, well_res_pressure - well_bhp)
+            delta_p = max(0.0, well_res_pressure - self.bhp)
             rate = self.pi * delta_p * actions[i]
+            
+            # Учитываем интерференцию между скважинами
+            if self.interaction_strength > 0:
+                for j in range(self.n_wells):
+                    if i != j:
+                        # Влияние j-й скважины на i-ю через дебит
+                        j_delta_p = max(0.0, self.state[j * self.state_dim_per_well] - self.bhp)
+                        j_rate = self.pi * j_delta_p * actions[j]
+                        # Уменьшаем дебит i-й скважины пропорционально активности j-й
+                        rate -= self.interaction_strength * j_rate / (self.n_wells - 1)
+            
+            # Убеждаемся, что дебит не отрицательный
+            rate = max(0.0, rate)
             current_rates[i] = rate
             
             # Рассчитываем добычу за этот шаг
@@ -311,6 +363,14 @@ class MultiWellSimulator:
             # Обновляем накопленную добычу для скважины
             well_cumulative_prod = self.state[start_idx + 2] + volume
             self.state[start_idx + 2] = well_cumulative_prod
+            self.cumulative_productions[i] = well_cumulative_prod
+            
+            # Обновляем текущий дебит в состоянии
+            self.state[start_idx + 1] = rate
+            
+            # Обновляем время
+            self.state[start_idx + 3] = self.time
+            self.times[i] = self.time
             
         # Обновляем накопленную общую добычу
         self.cumulative_production += total_produced
@@ -327,34 +387,36 @@ class MultiWellSimulator:
             for i in range(self.n_wells):
                 start_idx = i * self.state_dim_per_well
                 self.state[start_idx] = new_pressure
+                self.reservoir_pressures[i] = new_pressure
         else:
-            # Для отдельных резервуаров
+            # Для отдельных резервуаров с интерференцией
             for i in range(self.n_wells):
                 start_idx = i * self.state_dim_per_well
                 
-                # Рассчитываем падение давления от добычи этой скважины
+                # Рассчитываем базовое падение давления от добычи этой скважины
                 well_cumulative_prod = self.state[start_idx + 2]
-                depletion_ratio = min(1.0, well_cumulative_prod / (self.total_volume / self.n_wells)) if self.total_volume > 0 else 1.0
+                well_volume = self.total_volume / self.n_wells
+                depletion_ratio = min(1.0, well_cumulative_prod / well_volume) if well_volume > 0 else 1.0
                 new_pressure = self.initial_reservoir_pressure * (1.0 - depletion_ratio)
                 
-                # Учитываем влияние соседних скважин
+                # Учитываем влияние соседних скважин на пластовое давление
                 if self.interaction_strength > 0:
                     for j in range(self.n_wells):
                         if i != j:
-                            # Влияние j-й скважины на i-ю
+                            # Влияние j-й скважины на i-ю через давление
                             j_start_idx = j * self.state_dim_per_well
                             j_cumulative_prod = self.state[j_start_idx + 2]
-                            j_depletion = j_cumulative_prod / (self.total_volume / self.n_wells) if self.total_volume > 0 else 1.0
-                            # Снижаем давление пропорционально интерференции
-                            new_pressure -= self.initial_reservoir_pressure * j_depletion * self.interaction_strength / (self.n_wells - 1)
+                            j_depletion = j_cumulative_prod / well_volume if well_volume > 0 else 1.0
+                            
+                            # Снижаем давление пропорционально добыче соседней скважины
+                            interference_factor = self.interaction_strength / (self.n_wells - 1)
+                            pressure_drop = self.initial_reservoir_pressure * j_depletion * interference_factor
+                            new_pressure -= pressure_drop
                 
                 # Гарантируем неотрицательное давление
                 new_pressure = max(0.0, new_pressure)
                 self.state[start_idx] = new_pressure
-
-        # 5. Обновляем время для всех скважин
-        for i in range(self.n_wells):
-            self.state[i * self.state_dim_per_well + 3] = self.time
+                self.reservoir_pressures[i] = new_pressure
 
         # 6. Считаем общую награду как сумму дебитов всех скважин
         reward = sum(current_rates)
@@ -366,7 +428,7 @@ class MultiWellSimulator:
         all_wells_depleted = True
         for i in range(self.n_wells):
             start_idx = i * self.state_dim_per_well
-            if self.state[start_idx] > self.state[start_idx + 1]:  # res_pressure > bhp
+            if self.state[start_idx] > self.bhp:  # res_pressure > bhp
                 all_wells_depleted = False
                 break
 
@@ -379,7 +441,9 @@ class MultiWellSimulator:
             'total_produced': total_produced,
             'depletion_ratio': self.cumulative_production / self.total_volume if self.total_volume > 0 else 1.0,
             'remaining_time': max(0.0, self.max_time - self.time),
-            'valve_openings': actions.copy()
+            'valve_openings': actions.copy(),
+            'well_pressures': self.reservoir_pressures.copy(),
+            'well_cumulative_productions': self.cumulative_productions.copy()
         }
 
         return self.state, reward, done, info
@@ -391,6 +455,84 @@ class MultiWellSimulator:
     def get_action_dim(self) -> int:
         """Возвращает размерность вектора действия."""
         return self.n_wells
+    
+    def get_well_states(self) -> list:
+        """
+        Разделяет общий вектор состояния на индивидуальные состояния скважин.
+        
+        Returns:
+            list: Список массивов numpy, каждый из которых содержит состояние отдельной скважины.
+        """
+        well_states = []
+        for i in range(self.n_wells):
+            start_idx = i * self.state_dim_per_well
+            end_idx = start_idx + self.state_dim_per_well
+            well_state = self.state[start_idx:end_idx]
+            well_states.append(well_state)
+        return well_states
+    
+    def calculate_interference_matrix(self) -> np.ndarray:
+        """
+        Рассчитывает матрицу интерференции между скважинами.
+        
+        Returns:
+            np.ndarray: Матрица размера n_wells x n_wells, где каждый элемент [i, j] 
+                       показывает влияние скважины j на скважину i.
+        """
+        # Инициализируем матрицу интерференции
+        interference_matrix = np.zeros((self.n_wells, self.n_wells))
+        
+        # Заполняем матрицу
+        for i in range(self.n_wells):
+            for j in range(self.n_wells):
+                if i == j:
+                    # Влияние скважины на саму себя всегда 1.0
+                    interference_matrix[i, j] = 1.0
+                else:
+                    # Влияние j-й скважины на i-ю определяется интенсивностью взаимодействия
+                    # Можно модифицировать для учета пространственного расположения скважин
+                    interference_matrix[i, j] = self.interaction_strength / (self.n_wells - 1)
+        
+        return interference_matrix
+    
+    def get_field_info(self) -> dict:
+        """
+        Возвращает полную информацию о текущем состоянии месторождения.
+        
+        Returns:
+            dict: Словарь с информацией о месторождении и скважинах.
+        """
+        well_states = self.get_well_states()
+        
+        # Сбор информации о скважинах
+        wells_info = []
+        for i in range(self.n_wells):
+            well_info = {
+                'id': i,
+                'reservoir_pressure': well_states[i][0],
+                'current_rate': well_states[i][1],
+                'cumulative_production': well_states[i][2],
+                'time': well_states[i][3],
+                'valve_opening': self.last_actions[i] if self.last_actions[i] is not None else 0.0
+            }
+            wells_info.append(well_info)
+        
+        # Сбор общей информации о месторождении
+        field_info = {
+            'wells': wells_info,
+            'total_wells': self.n_wells,
+            'shared_reservoir': self.shared_reservoir,
+            'interaction_strength': self.interaction_strength,
+            'total_volume': self.total_volume,
+            'remaining_volume': self.total_volume - self.cumulative_production,
+            'depletion_ratio': self.cumulative_production / self.total_volume if self.total_volume > 0 else 1.0,
+            'total_cumulative_production': self.cumulative_production,
+            'current_total_rate': sum(well_state[1] for well_state in well_states),
+            'current_time': self.time,
+            'remaining_time': max(0.0, self.max_time - self.time)
+        }
+        
+        return field_info
 
 # Пример использования
 if __name__ == '__main__':
@@ -415,12 +557,17 @@ if __name__ == '__main__':
     state = simulator.reset()
     print(f"Начальное состояние: {state}")
     
+    # Можно также использовать случайное начальное состояние
+    # state = simulator.reset_to_random_state(min_depletion=0.1, max_depletion=0.5)
+    # print(f"Случайное начальное состояние: {state}")
+    
     total_reward = 0
     done = False
     step = 0
     
-    while not done:
+    while not done and step < 365:  # Ограничиваем максимальным числом шагов
         # Пример стратегии: разное открытие штуцеров для разных скважин
+        # В реальности, это место для алгоритма оптимизации
         actions = np.array([0.8, 0.5, 0.3])
         
         next_state, reward, done, info = simulator.step(actions)
@@ -429,21 +576,26 @@ if __name__ == '__main__':
         step += 1
         
         if step % 30 == 0 or done:
-            # Разделяем общий вектор состояния на состояния отдельных скважин
-            well_states = []
-            state_size = len(state) // simulator.n_wells
-            for i in range(simulator.n_wells):
-                well_state = state[i*state_size:(i+1)*state_size]
-                well_states.append(well_state)
+            # Получаем состояния скважин
+            well_states = simulator.get_well_states()
             
-            print(f"Шаг: {step}, Время: {well_states[0][3]:.1f} дней")
+            print(f"Шаг: {step}, Время: {simulator.time:.1f} дней")
             for i, well_state in enumerate(well_states):
-                print(f"  Скважина {i+1}: Давление: {well_state[0]:.2f} атм, Дебит: {well_state[1]:.2f} м3/сут, Добыча: {well_state[2]:.1f} м3")
-            print(f"  Суммарный дебит: {reward:.2f} м3/сут, Завершено: {done}")
+                print(f"  Скважина {i+1}: Давление: {well_state[0]:.2f} атм, "
+                      f"Дебит: {well_state[1]:.2f} м3/сут, "
+                      f"Добыча: {well_state[2]:.1f} м3, "
+                      f"Штуцер: {actions[i]:.2f}")
+            print(f"  Суммарный дебит: {reward:.2f} м3/сут, Общая добыча: {simulator.cumulative_production:.1f} м3")
+            print(f"  Истощение резервуара: {simulator.cumulative_production / simulator.total_volume * 100:.1f}%, Завершено: {done}")
     
-    print(f"Симуляция завершена после {step} шагов ({well_states[0][3]:.1f} дней).")
+    print(f"\nСимуляция завершена после {step} шагов ({simulator.time:.1f} дней).")
+    print(f"Суммарная добыча: {simulator.cumulative_production:.1f} м3")
+    print(f"Средний дебит: {simulator.cumulative_production / step:.1f} м3/сут")
     
-    # Рассчитываем суммарную добычу по всем скважинам
-    total_production = sum(well_state[2] for well_state in well_states)
-    print(f"Суммарная добыча: {total_production:.1f} м3")
-    print(f"Суммарная награда * dt: {total_reward * simulator.simulators[0].dt:.1f}")
+    # Дополнительная информация о интерференции
+    if simulator.interaction_strength > 0:
+        print("\nМатрица интерференции между скважинами:")
+        interference_matrix = simulator.calculate_interference_matrix()
+        for i in range(simulator.n_wells):
+            row = " ".join([f"{val:.2f}" for val in interference_matrix[i]])
+            print(f"  Скважина {i+1} -> {row}")
