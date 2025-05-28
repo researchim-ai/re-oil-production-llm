@@ -21,6 +21,7 @@ The trained models learn to control the choke opening (from 0 to 1) to maximize 
 
 - **Single and Multi-Well Simulations**: Simulate both standalone and interconnected well systems
 - **GRPO Training**: Efficient policy optimization for LLMs
+- **Random Initial States**: Support for training from random intermediate states in the well lifecycle
 - **Prompt Engineering**: Structured input formats for consistent and effective LLM responses
 - **WandB and TensorBoard Integration**: Comprehensive experiment tracking and visualization
 - **Quantization Support**: 4-bit and 8-bit quantization for efficient model training
@@ -47,6 +48,23 @@ To run training:
 python -m grpo.main --forecast_days 1 --simulation_max_time 4 --kl_weight 0.0 --lr 1e-5 --clip_eps 0.3 --gamma 0.99 --total_steps 1000 --rollouts_per_step 8 --train_batch_size 8 --temperature 0.7 --wandb --use_discrete_actions
 ```
 
+### Example Commands
+
+#### Basic Training
+```bash
+python -m grpo.main --forecast_days 1 --simulation_max_time 365 --kl_weight 0.02 --lr 1e-5 --total_steps 1000 --rollouts_per_step 16 --train_batch_size 8 --wandb
+```
+
+#### Training with Random Initial States
+```bash
+python -m grpo.main --forecast_days 1 --simulation_max_time 365 --kl_weight 0.02 --lr 1e-5 --total_steps 1000 --rollouts_per_step 16 --train_batch_size 8 --wandb --use_random_states --random_state_min_depletion 0.1 --random_state_max_depletion 0.7 --random_state_probability 0.8
+```
+
+#### Multi-Well Training
+```bash
+python -m grpo.main --multi_well --n_wells 3 --interaction_strength 0.2 --shared_reservoir --forecast_days 1 --simulation_max_time 365 --kl_weight 0.02 --lr 1e-5 --total_steps 1000 --rollouts_per_step 16 --train_batch_size 8 --wandb
+```
+
 ### Main Parameters
 
 The script supports multiple parameters for customizing the training process:
@@ -68,6 +86,12 @@ The script supports multiple parameters for customizing the training process:
 --productivity_index     Productivity index (m3/day/atm)
 --total_volume           Total reservoir volume (m3)
 --forecast_days          Number of days to forecast in each step
+
+# Random Initial States Parameters
+--use_random_states              Enable training from random well states
+--random_state_min_depletion     Minimum depletion ratio for random states (0-1)
+--random_state_max_depletion     Maximum depletion ratio for random states (0-1)
+--random_state_probability       Probability of using random states in each global step
 ```
 
 ## Current State

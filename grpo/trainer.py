@@ -168,72 +168,6 @@ class Logger:
             print(f"{COLOR_BLUE}TensorBoard writer closed.{COLOR_RESET}")
 
 
-###############################################################################
-# БЛОК С ОПРЕДЕЛЕНИЕМ "ИНСТРУМЕНТОВ" (tools) И ФУНКЦИИ ВЫЗОВА
-###############################################################################
-TOOLS = {}
-
-def register_tool(name: str):
-    """
-    Декоратор для регистрации инструмента по имени.
-    """
-    def decorator(func):
-        TOOLS[name] = func
-        return func
-    return decorator
-
-@register_tool("calc")
-def calc_tool(expression: str) -> str:
-    """
-    Простой инструмент для вычисления арифметических выражений.
-    Используется eval, в реальном продакшене нужно быть осторожным.
-    """
-    try:
-        # Добавим простую очистку, но основная логика форматирования должна быть на LLM
-        expression = expression.strip()
-        # Убедимся, что строка не пустая после strip
-        if not expression:
-            return "Calc error: Empty expression"
-        result = eval(expression, {'__builtins__': {}}, {}) # Ограничиваем eval
-        return str(result)
-    except Exception as e:
-        # Возвращаем более информативную ошибку
-        return f"Calc error: Cannot evaluate '{expression}'. Details: {e}"
-
-# --- Изменяем detect_and_call_tools ---
-def detect_and_call_tools(generated_text: str) -> Optional[Tuple[str, str, str]]:
-    """
-    Находит *первый* вызов инструмента, выполняет его и возвращает кортеж:
-    (tool_name, tool_input, tool_result_str).
-    Возвращает None, если инструмент не найден или не вызывался.
-    """
-    pattern = r"<tool:(\w+)>(.*?)</tool>"
-    match = re.search(pattern, generated_text, flags=re.DOTALL)
-
-    if match:
-        tool_name = match.group(1)
-        tool_input = match.group(2).strip()
-        tool_func = TOOLS.get(tool_name)
-        tool_result_str: Optional[str] = None
-
-        if tool_func:
-            try:
-                tool_result_str = tool_func(tool_input)
-            except Exception as e:
-                tool_result_str = f"Error executing tool '{tool_name}': {e}"
-        else:
-            tool_result_str = f"[Tool '{tool_name}' not found]"
-
-        # Возвращаем имя, ввод и результат
-        if tool_result_str is not None:
-            return tool_name, tool_input, tool_result_str
-        else:
-             # Случай, когда tool_func вернул None, хотя не должен
-             return tool_name, tool_input, "[Error: Tool function returned None]"
-    else:
-        return None # Инструмент не вызывался
-
-
 def load_model(
     model_name_or_path: str,
     trust_remote_code: bool = False,
@@ -345,35 +279,6 @@ SYSTEM_PROMPT_TEMPLATE = """Ты - система управления нефт�
 "Выбираю значение 6"
 """
 
-# Первый системный промпт - только для рассуждения и вызова инструмента
-FIRST_STEP_PROMPT = """- Обдумай процесс рассуждения и объясни его в тегах <reasoning>...</reasoning>
-- Вызови инструмент для расчета, используя: <tool:calc>вопрос для расчета</tool>
-
-Пример формата:
-
-Рассчитать 2 + 2
-
-<reasoning>Мне нужно сложить эти числа</reasoning>
-<tool:calc>2 + 2</tool>
-
-Твоя задача:
-"""
-
-# Второй системный промпт - только для ответа
-SECOND_STEP_PROMPT = """Диалог между Пользователем и Ассистентом. Теперь тебе нужно скопировать ответ из инструмента в тег ответа.
-
-- Твой ответ ДОЛЖЕН содержать только тег ответа
-- После получения результата от инструмента, предоставь итоговый ответ в тегах <answer>...</answer>
-- Ответом должно быть ЧИСЛО от 1 до 10, соответствующее выбранному варианту степени открытия штуцера
-
-Пример формата:
-
-Результат инструмента: 4
-<answer>4</answer>
-
-Вот вывод инструмента:
-"""
-
 @torch.no_grad()
 def rollout(
     model: AutoModelForCausalLM,
@@ -392,41 +297,39 @@ def rollout(
     all_sequences = []
     all_completions_text = []
     all_rewards_dicts = []
+    
+    # Создаем системный промпт на основе шаблона
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        forecast_days=1,  # Значение по умолчанию
+        weekly_note="",
+        monthly_note=""
+    )
 
     # Метрики, агрегированные по группе роллаутов (для одной задачи)
     group_stats = {
         "total_reward_sum": 0.0,
-        "tool_called_count": 0,
-        "tool_executed_ok_count": 0,
         "answer_format_ok_count": 0,
         "answer_correct_count": 0,
     }
 
     for rollout_idx in range(num_rollouts):
         rewards = {
-            "step1_tool_call_format": 0.0,
-            "step1_tool_execution": 0.0,
-            "step2_answer_format": 0.0,
-            "step2_answer_content": 0.0,
+            "answer_format": 0.0,
+            "answer_content": 0.0,
         }
         rollout_stats = { # Статистика для одного этого роллаута
-             "step1_completion": "", "tool_called": False, "tool_input": None,
-             "tool_result": None, "step2_completion": "", "final_answer": None,
+             "completion": "", "final_answer": None,
              "is_correct_answer": False, "error_type": None
         }
 
         chat_messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": FIRST_STEP_PROMPT + task},
+            {"role": "user", "content": task},
         ]
 
         current_messages = chat_messages.copy()
         full_dialog_text_for_log = "" # Текст для логирования примеров
-        steps_count = 0
-        max_steps = 2
         rollout_tokens = []
-        actual_tool_result: Optional[str] = None
-        step1_failed = False
 
         initial_prompt_text = tokenizer.apply_chat_template(
             current_messages, tokenize=False, add_generation_prompt=True
@@ -437,115 +340,67 @@ def rollout(
         ).input_ids.to("cuda")
         rollout_tokens.append(prompt_tokens[0])
 
-        # --- Шаг 1 ---
-        steps_count += 1
-        chat_prompt_text_step1 = tokenizer.apply_chat_template(
+        # Генерация ответа
+        chat_prompt_text = tokenizer.apply_chat_template(
             current_messages, tokenize=False, add_generation_prompt=True
         )
-        model_inputs_step1 = tokenizer(
-            chat_prompt_text_step1, return_tensors="pt", padding=False
+        model_inputs = tokenizer(
+            chat_prompt_text, return_tensors="pt", padding=False
         ).to("cuda")
 
         generation_config = GenerationConfig(
             do_sample=True, top_p=top_p, temperature=temperature,
             max_new_tokens=128, pad_token_id=tokenizer.eos_token_id,
         )
-        sequence_ids_step1 = model.generate(**model_inputs_step1, generation_config=generation_config)
-        new_tokens_step1 = sequence_ids_step1[0, model_inputs_step1["input_ids"].shape[1]:]
-        rollout_tokens.append(new_tokens_step1)
+        sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
+        new_tokens = sequence_ids[0, model_inputs["input_ids"].shape[1]:]
+        rollout_tokens.append(new_tokens)
 
-        completion_step1 = tokenizer.decode(new_tokens_step1, skip_special_tokens=True)
-        rollout_stats["step1_completion"] = completion_step1
-        full_dialog_text_for_log += f"**Step 1 Completion:**\n```\n{completion_step1}\n```\n"
-        current_messages.append({"role": "assistant", "content": completion_step1})
+        completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        rollout_stats["completion"] = completion
+        full_dialog_text_for_log += f"**Completion:**\n```\n{completion}\n```\n"
+        current_messages.append({"role": "assistant", "content": completion})
 
-        # Вызов и проверка инструмента
-        tool_call_info = detect_and_call_tools(completion_step1)
-        if tool_call_info:
-            tool_name, tool_input, actual_tool_result = tool_call_info
-            rewards["step1_tool_call_format"] += 0.2
-            rollout_stats["tool_called"] = True
-            group_stats["tool_called_count"] += 1
-            rollout_stats["tool_input"] = tool_input
-            rollout_stats["tool_result"] = actual_tool_result
-            full_dialog_text_for_log += f"**Tool Call:** `{tool_name}({tool_input})` -> `{actual_tool_result}`\n"
-
-            if "error" in actual_tool_result.lower():
-                rewards["step1_tool_execution"] -= 1.0
-                step1_failed = True
-                rollout_stats["error_type"] = "Tool Execution Error"
-                print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {COLOR_RED}Tool Error:{COLOR_RESET} {actual_tool_result}")
-            else:
-                rewards["step1_tool_execution"] += 0.5
-                group_stats["tool_executed_ok_count"] += 1
-                print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {COLOR_GREEN}Tool OK:{COLOR_RESET} {tool_input} -> {actual_tool_result}")
-        else:
-            rewards["step1_tool_call_format"] -= 0.5
-            step1_failed = True
-            rollout_stats["error_type"] = "Tool Format Error"
-            full_dialog_text_for_log += "**Tool Call:** Failed (Format Error)\n"
-            print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {COLOR_RED}Tool Call Format Error{COLOR_RESET}")
-
-        # --- Шаг 2 ---
-        if not step1_failed and actual_tool_result is not None:
-            steps_count += 1
-            user_message_step2 = f"{SECOND_STEP_PROMPT}\n\nTool result: {actual_tool_result}"
-            current_messages.append({"role": "user", "content": user_message_step2})
-            full_dialog_text_for_log += f"**Prompt Step 2 (User):**\n```\nTool result: {actual_tool_result}\n```\n"
-
-            chat_prompt_text_step2 = tokenizer.apply_chat_template(
-                current_messages, tokenize=False, add_generation_prompt=True
-            )
-            model_inputs_step2 = tokenizer(
-                chat_prompt_text_step2, return_tensors="pt", padding=False
-            ).to("cuda")
-
-            sequence_ids_step2 = model.generate(**model_inputs_step2, generation_config=generation_config)
-            new_tokens_step2 = sequence_ids_step2[0, model_inputs_step2["input_ids"].shape[1]:]
-            rollout_tokens.append(new_tokens_step2)
-
-            completion_step2 = tokenizer.decode(new_tokens_step2, skip_special_tokens=True)
-            rollout_stats["step2_completion"] = completion_step2
-            full_dialog_text_for_log += f"**Step 2 Completion:**\n```\n{completion_step2}\n```\n"
-            current_messages.append({"role": "assistant", "content": completion_step2})
-
-            answer_match = re.match(r"^\s*<answer>(.*?)</answer>\s*$", completion_step2, flags=re.DOTALL)
-            if answer_match:
-                rewards["step2_answer_format"] += 0.3
+        # Проверка формата ответа - ожидаем число от 1 до 10
+        answer_match = re.match(r"^\s*(\d+)\s*$", completion)
+        if answer_match:
+            final_answer = answer_match.group(1).strip()
+            # Проверяем, что это число от 1 до 10
+            if final_answer.isdigit() and 1 <= int(final_answer) <= 10:
+                rewards["answer_format"] += 0.3
                 group_stats["answer_format_ok_count"] += 1
-                final_answer = answer_match.group(1).strip()
                 rollout_stats["final_answer"] = final_answer
                 full_dialog_text_for_log += f"**Final Answer:** `{final_answer}`\n"
 
-                # Сравниваем с oracle_answer вместо actual_tool_result
+                # Сравниваем с oracle_answer
                 if final_answer == oracle_answer:
-                    rewards["step2_answer_content"] += 1.0
+                    rewards["answer_content"] += 1.0
                     rollout_stats["is_correct_answer"] = True
                     group_stats["answer_correct_count"] += 1
-                    print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_GREEN}Answer OK:{COLOR_RESET} {final_answer} (matches oracle: {oracle_answer})")
+                    print(f"Rollout {rollout_idx+1}/{num_rollouts} | {COLOR_GREEN}Answer OK:{COLOR_RESET} {final_answer} (matches oracle: {oracle_answer})")
                 else:
-                    rewards["step2_answer_content"] -= 0.5
+                    rewards["answer_content"] -= 0.5
                     rollout_stats["error_type"] = "Answer Content Mismatch"
-                    print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_YELLOW}Answer Content Mismatch:{COLOR_RESET} Got '{final_answer}', Expected '{oracle_answer}' (Tool result was: {actual_tool_result})")
+                    print(f"Rollout {rollout_idx+1}/{num_rollouts} | {COLOR_YELLOW}Answer Content Mismatch:{COLOR_RESET} Got '{final_answer}', Expected '{oracle_answer}'")
             else:
-                rewards["step2_answer_format"] -= 0.8
-                rollout_stats["error_type"] = "Answer Format Error"
-                full_dialog_text_for_log += "**Final Answer:** Failed (Format Error)\n"
-                print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_RED}Answer Format Error:{COLOR_RESET} {completion_step2[:50]}...") # Показываем начало ошибки
+                rewards["answer_format"] -= 0.8
+                rollout_stats["error_type"] = "Answer Out of Range"
+                full_dialog_text_for_log += "**Final Answer:** Failed (Number Out of Range)\n"
+                print(f"Rollout {rollout_idx+1}/{num_rollouts} | {COLOR_RED}Answer Out of Range:{COLOR_RESET} {completion[:50]}...")
         else:
-             full_dialog_text_for_log += "**Step 2:** Skipped\n"
-             print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_YELLOW}Skipped{COLOR_RESET}")
+            rewards["answer_format"] -= 0.8
+            rollout_stats["error_type"] = "Answer Format Error"
+            full_dialog_text_for_log += "**Final Answer:** Failed (Format Error)\n"
+            print(f"Rollout {rollout_idx+1}/{num_rollouts} | {COLOR_RED}Answer Format Error:{COLOR_RESET} {completion[:50]}...")
 
         total_reward = sum(rewards.values())
         group_stats["total_reward_sum"] += total_reward
 
-        # Логируем детальные награды для *каждого* роллаута (может быть шумно, но полезно для отладки)
+        # Логируем детальные награды для *каждого* роллаута
         logger.log({
             f"rollout_rewards/total": total_reward,
-            f"rollout_rewards/step1_format": rewards["step1_tool_call_format"],
-            f"rollout_rewards/step1_exec": rewards["step1_tool_execution"],
-            f"rollout_rewards/step2_format": rewards["step2_answer_format"],
-            f"rollout_rewards/step2_content": rewards["step2_answer_content"],
+            f"rollout_rewards/format": rewards["answer_format"],
+            f"rollout_rewards/content": rewards["answer_content"],
         }, step=global_step)
 
         if rollout_tokens:
@@ -559,20 +414,14 @@ def rollout(
 
     # --- Расчет и логирование агрегированных метрик для группы ---
     avg_group_reward = group_stats["total_reward_sum"] / num_rollouts if num_rollouts > 0 else 0.0
-    tool_called_rate = group_stats["tool_called_count"] / num_rollouts if num_rollouts > 0 else 0.0
-    tool_exec_ok_rate = group_stats["tool_executed_ok_count"] / group_stats["tool_called_count"] if group_stats["tool_called_count"] > 0 else 0.0
-    answer_format_ok_rate = group_stats["answer_format_ok_count"] / num_rollouts if num_rollouts > 0 else 0.0 # Или от числа успешных шагов 1? Пока от всех
+    answer_format_ok_rate = group_stats["answer_format_ok_count"] / num_rollouts if num_rollouts > 0 else 0.0
     answer_correct_rate = group_stats["answer_correct_count"] / group_stats["answer_format_ok_count"] if group_stats["answer_format_ok_count"] > 0 else 0.0
 
     logger.log({
         "group_avg/reward": avg_group_reward,
-        "group_rates/tool_called": tool_called_rate,
-        "group_rates/tool_exec_ok": tool_exec_ok_rate,
         "group_rates/answer_format_ok": answer_format_ok_rate,
         "group_rates/answer_correct": answer_correct_rate,
     }, step=global_step)
-
-    # --- Конец изменений в rollout ---
 
     # Паддинг и создание маски (остается как было в предыдущей версии)
     if not all_sequences:
@@ -609,33 +458,21 @@ def rollout(
     action_mask = torch.zeros_like(sequence_ids[:, 1:], dtype=torch.bool)
 
     len_prompt = rollout_tokens[0].size(0) if rollout_tokens else 0 # Длина первого промпта
-    len_comp1 = rollout_tokens[1].size(0) if len(rollout_tokens) > 1 else 0 # Длина ответа 1
-    len_comp2 = rollout_tokens[2].size(0) if len(rollout_tokens) > 2 else 0 # Длина ответа 2
+    len_comp = rollout_tokens[1].size(0) if len(rollout_tokens) > 1 else 0 # Длина ответа
 
     for i, total_len in enumerate(original_lengths):
-        start1 = len_prompt
-        end1 = start1 + len_comp1
-        mask_start1 = max(0, start1 - 1)
-        mask_end1 = max(0, end1 - 1)
+        start = len_prompt
+        end = start + len_comp
+        mask_start = max(0, start - 1)
+        mask_end = max(0, end - 1)
         # Исправляем условие, чтобы не выходить за пределы маски
-        if mask_end1 > mask_start1 and mask_start1 < action_mask.shape[1]:
-             actual_end1 = min(mask_end1, action_mask.shape[1])
-             action_mask[i, mask_start1 : actual_end1] = True
-
-        start2 = end1
-        end2 = start2 + len_comp2
-        mask_start2 = max(0, start2 - 1)
-        mask_end2 = max(0, end2 - 1)
-        # Исправляем условие
-        if mask_end2 > mask_start2 and mask_start2 < action_mask.shape[1]:
-             actual_end2 = min(mask_end2, action_mask.shape[1])
-             action_mask[i, mask_start2 : actual_end2] = True
+        if mask_end > mask_start and mask_start < action_mask.shape[1]:
+             actual_end = min(mask_end, action_mask.shape[1])
+             action_mask[i, mask_start : actual_end] = True
 
         valid_len_mask = total_len - 1
         if valid_len_mask < action_mask.shape[1]:
              action_mask[i, valid_len_mask:] = False
-        # Дополнительно обрежем маску по максимальной длине (уже не нужно из-за min выше)
-        # action_mask[i, max_seq_length-1:] = False # Можно убрать
 
     returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
     for i, rew_dict in enumerate(all_rewards_dicts):
@@ -643,7 +480,6 @@ def rollout(
 
     # Возвращаем текст completions для возможного логирования примеров
     return sequence_ids, returns.to(sequence_ids.device), action_mask, all_completions_text
-
 
 def init_rng(seed: int):
     random.seed(seed)
@@ -655,11 +491,6 @@ def init_rng(seed: int):
         # Не всегда нужно для воспроизводимости, может замедлить
         # torch.backends.cudnn.deterministic = True
         # torch.backends.cudnn.benchmark = False
-
-def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Нормализует преимущества в группе."""
-    return (returns - returns.mean()) / (returns.std() + eps)
-
 
 def sequence_log_probs_from_logits(
     logits: torch.tensor, output_ids: torch.tensor
@@ -776,7 +607,17 @@ def parse_args():
     parser.add_argument('--interaction_strength', type=float, default=0.1, help='Strength of interaction between wells (0-1)')
     parser.add_argument('--shared_reservoir', action='store_true', help='Use shared reservoir in multi-well simulator')
 
+    # Аргументы для логирования
     parser.add_argument('--log_completions_interval', type=int, default=10, help='Log example episode rollout every N global steps')
+    
+    # Аргументы для случайного начального состояния
+    parser.add_argument('--use_random_states', action='store_true', help='Use random initial states for training')
+    parser.add_argument('--random_state_min_depletion', type=float, default=0.0, help='Minimum depletion ratio for random states (0-1)')
+    parser.add_argument('--random_state_max_depletion', type=float, default=0.8, help='Maximum depletion ratio for random states (0-1)')
+    parser.add_argument('--random_state_probability', type=float, default=0.7, 
+                      help='Probability of using random states in each global step (0-1). 0=never, 1=always')
+    parser.add_argument('--use_realistic_ranges', action='store_true', default=True,
+                      help='Use realistic parameter constraints for random states')
 
     args = parser.parse_args()
 
@@ -790,266 +631,6 @@ def parse_args():
 
     return args
 
-###############################################################################
-# БЛОК ФУНКЦИЙ ДЛЯ РАБОТЫ С СИМУЛЯТОРОМ
-###############################################################################
-
-def rollout_simulator(
-    model: AutoModelForCausalLM,
-    tokenizer: PreTrainedTokenizer,
-    simulator: Union[SingleWellSimulator, MultiWellSimulator],
-    max_steps: int = 10,
-    temperature: float = 0.7,
-    top_p: float = 0.95,
-    do_sample: bool = True,
-    seed: Optional[int] = None,
-    verbose: bool = False,
-) -> Tuple[
-    torch.Tensor,  # episode_tokens,
-    torch.Tensor,  # action_masks
-    torch.Tensor,  # rewards
-    Dict,          # episode_metrics
-]:
-    """
-    Выполняет симуляцию одного эпизода с одной скважиной.
-    
-    Args:
-        model: Языковая модель
-        tokenizer: Токенизатор
-        simulator: Объект симулятора (SingleWellSimulator или MultiWellSimulator)
-        max_steps: Максимальное количество шагов
-        temperature: Температура генерации
-        top_p: Параметр top_p для генерации
-        do_sample: Выполнять ли семплирование при генерации
-        seed: Случайное зерно для воспроизводимости
-        verbose: Выводить ли информацию в процессе выполнения
-        
-    Returns:
-        Кортеж из:
-            episode_tokens: Тензор токенов взаимодействия
-            action_masks: Маски для токенов действий
-            rewards: Тензор наград
-            episode_metrics: Словарь метрик эпизода
-    """
-    model.eval()
-    device = next(model.parameters()).device
-
-    # Инициализируем метрики эпизода
-    episode_tokens = []
-    episode_actions = []
-    episode_rewards = []
-    episode_format_rewards = []
-    
-    # Инициализируем буфер для всего диалога (вход-ответ-вход-ответ...)
-    simulator.reset(seed=seed)
-    state = simulator.get_state()
-    
-    # Проверяем, имеем ли мы дело с многоскважинным симулятором
-    is_multi_well = hasattr(simulator, 'well_names') and len(getattr(simulator, 'well_names', [])) > 1
-    
-    # Сохраняем историю диалога
-    history = []
-    
-    episode_production = 0.0
-    total_reward = 0.0
-    
-    # Для одного роллаута не используем заготовленный шаблон PROMPT_TEMPLATE, 
-    # а используем функции из модуля prompts.py
-    
-    if verbose:
-        print("Начинаем новый эпизод")
-    
-    # Выполняем шаги симуляции
-    for step in range(max_steps):
-        # Форматируем состояние
-        state_text = format_state(state, simulator)
-        
-        # Получаем промпт на основе текущего состояния и истории
-        if not history:
-            # Первый шаг эпизода
-            prompt = get_first_step_prompt(state_text, is_multi_well)
-        else:
-            # Последующие шаги с историей
-            history_text = ' | '.join(history[-2:])  # Ограничиваем 2 последними шагами
-            prompt = get_subsequent_step_prompt(state_text, history_text, is_multi_well)
-        
-        if verbose:
-            print(f"\nШаг {step+1}/{max_steps}")
-            print(f"Промпт:\n{prompt}")
-
-        # Токенизируем запрос
-        tokenized_prompt = tokenizer(
-            prompt, 
-            return_tensors="pt",
-            padding=True,
-            truncation=True
-        ).to(device)
-        
-        # Сохраняем длину запроса для создания маски действий
-        prompt_length = tokenized_prompt.input_ids.shape[1]
-        
-        # Генерируем ответ
-        with torch.no_grad():
-            output = model.generate(
-                **tokenized_prompt,
-                generation_config=GenerationConfig(
-                    max_new_tokens=max_new_tokens_per_step,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=top_p,
-                    pad_token_id=tokenizer.eos_token_id,
-                ),
-                return_dict_in_generate=True,
-                output_scores=True
-            )
-        
-        # Декодируем ответ
-        response_ids = output.sequences[0, prompt_length:]
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-        
-        # Парсим действие и получаем награды за форматирование
-        action_value, format_rewards = parse_llm_action(response_text)
-        
-        print(f"Симулятор: Ответ модели: '{response_text}'")
-        if action_value is not None:
-            print(f"Симулятор: Действие: {action_value:.4f}")
-        else:
-            print(f"Симулятор: Действие: ПРОПУЩЕНО из-за неправильного формата")
-        print(f"Симулятор: Награды за форматирование: {format_rewards}")
-        
-        # Сохраняем токены, действия, награды
-        full_sequence = torch.cat([tokenized_prompt.input_ids[0], response_ids])
-        episode_tokens.append(full_sequence)
-        
-        # Проверяем, правильный ли формат
-        if action_value is not None:
-            # Применяем действие к симулятору
-            simulator.step(action_value)
-            
-            # Получаем новое состояние и награду
-            new_state = simulator.state
-            # Награда за шаг = добыча за текущий шаг
-            step_reward = new_state[2] - state[2] 
-            
-            # Добавляем награды за форматирование ответа
-            format_reward = sum(format_rewards.values())
-            total_format_reward = format_reward
-            episode_format_rewards.append(format_rewards)
-            
-            # Общая награда включает награду за действие и за форматирование
-            full_step_reward = step_reward + total_format_reward
-            
-            # Обновляем общую награду и добычу
-            total_reward += full_step_reward
-            episode_production = new_state[2]  # Общая добыча - третий элемент в state
-            
-            episode_rewards.append(torch.tensor(full_step_reward))
-            episode_actions.append(action_value)
-            
-            # Создаем маску для токенов действия
-            # Все токены ответа модели (отличные от промта) помечаются как действия
-            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool)
-            action_mask[prompt_length:] = True
-            episode_action_masks.append(action_mask)
-            
-            # Сохраняем позиции токенов действия для более точного распределения наград
-            action_positions = torch.arange(prompt_length, len(full_sequence))
-            episode_action_positions.append(action_positions)
-            
-            print(f"Симулятор: Шаг {step+1}, Награда: {full_step_reward:.4f}, Общая награда: {total_reward:.4f}, Добыча: {episode_production:.2f} м³")
-            
-            # Обновляем текущее состояние и сохраняем последнее успешное состояние
-            history.append(state_text)
-            state = new_state
-        else:
-            # Если формат неправильный, даем отрицательную награду, но не выполняем шаг симулятора
-            format_reward = sum(format_rewards.values())
-            total_format_reward = format_reward
-            episode_format_rewards.append(format_rewards)
-            
-            # Отрицательная награда только за формат
-            full_step_reward = total_format_reward
-            total_reward += full_step_reward
-            
-            episode_rewards.append(torch.tensor(full_step_reward))
-            episode_actions.append(0.0)  # Действие не выполнялось, но в списке должно быть значение
-            
-            # Создаем маску для токенов действия
-            action_mask = torch.zeros_like(full_sequence, dtype=torch.bool)
-            action_mask[prompt_length:] = True
-            episode_action_masks.append(action_mask)
-            
-            # Сохраняем позиции токенов действия для более точного распределения наград
-            action_positions = torch.arange(prompt_length, len(full_sequence))
-            episode_action_positions.append(action_positions)
-            
-            print(f"Симулятор: Шаг {step+1} ПРОПУЩЕН из-за неправильного формата, Штраф: {full_step_reward:.4f}, Общая награда: {total_reward:.4f}")
-            skipped_steps += 1
-        
-        step += 1
-        
-        # Если слишком много пропущенных шагов подряд, прерываем эпизод
-        if skipped_steps > 5:
-            print(f"Симулятор: Слишком много пропущенных шагов, прерываем эпизод.")
-            break
-    
-    # Объединяем все токены и маски для эпизода
-    if episode_tokens:
-        # Объединяем все последовательности в одну
-        episode_full_tokens = torch.cat(episode_tokens)
-        
-        # Создаем полную маску действий
-        episode_full_action_mask = torch.zeros(len(episode_full_tokens), dtype=torch.bool, device=device)
-        
-        # Заполняем маску на основе позиций
-        offset = 0
-        for action_mask in episode_action_masks:
-            length = len(action_mask)
-            episode_full_action_mask[offset:offset+length] = action_mask
-            offset += length
-        
-        # Собираем статистику эпизода
-        episode_stats = {
-            "reward": total_reward,
-            "production": episode_production,
-            "steps": step - 1,
-            "actions": episode_actions,
-            "format_rewards": episode_format_rewards,
-            "action_positions": episode_action_positions,
-            "skipped_steps": skipped_steps
-        }
-        
-        # Добавляем данные эпизода в общие списки
-        all_episodes_tokens.append(episode_full_tokens)
-        all_episodes_action_masks.append(episode_full_action_mask)
-        all_episodes_rewards.append(torch.tensor(episode_rewards))
-        all_episodes_stats.append(episode_stats)
-    
-    return all_episodes_tokens, all_episodes_action_masks, all_episodes_rewards, all_episodes_stats
-
-def calculate_discounted_returns(rewards, gamma=0.99):
-    """
-    Вычисляет дисконтированные возвраты для последовательности наград.
-    
-    Args:
-        rewards: список или тензор наград
-        gamma: коэффициент дисконтирования
-        
-    Returns:
-        torch.Tensor: дисконтированные возвраты
-    """
-    if isinstance(rewards, list):
-        rewards = torch.tensor(rewards)
-    
-    returns = torch.zeros_like(rewards, dtype=torch.float32)
-    
-    # Вычисляем возвраты от конца к началу
-    R = 0
-    for i in reversed(range(len(rewards))):
-        R = rewards[i] + gamma * R
-        returns[i] = R
-    
-    return returns
 
 def main():
     args = parse_args()
@@ -1217,13 +798,27 @@ def main():
         )
         
         # Выполняем параллельные роллауты
+        # Определяем, использовать ли случайные состояния на этом шаге, на основе заданной вероятности
+        use_random_on_this_step = args.use_random_states and random.random() < args.random_state_probability
+        
+        if use_random_on_this_step:
+            print(f"{COLOR_CYAN}Шаг {global_step}: Используем случайные начальные состояния "
+                 f"(истощение {args.random_state_min_depletion:.2f}-{args.random_state_max_depletion:.2f}){COLOR_RESET}")
+        else:
+            print(f"{COLOR_CYAN}Шаг {global_step}: Используем начальные состояния скважин{COLOR_RESET}")
+        
         episode_tokens, action_masks, rewards, episode_stats = parallel_rollout(
             model=model,
             tokenizer=tokenizer,
             parallel_sim=parallel_sim,
             n_steps=int(args.simulation_max_time / args.simulation_dt),  # Максимальное количество шагов
             temperature=temperature,
-            verbose=True
+            top_p=top_p,
+            verbose=True,
+            use_random_states=use_random_on_this_step,
+            random_state_min_depletion=args.random_state_min_depletion,
+            random_state_max_depletion=args.random_state_max_depletion,
+            use_realistic_ranges=args.use_realistic_ranges
         )
         
         # Обрабатываем результаты и создаем буфер опыта
@@ -1316,7 +911,36 @@ def main():
             global_step += 1
             continue
         
-        # Преобразуем списки в тензоры
+        # Проверяем и выравниваем размеры тензоров перед стекированием
+        # Определяем максимальную длину последовательности в батче
+        max_seq_length = max([logits.shape[0] for logits in model_batch_data["logits"]])
+        
+        # Выравниваем размеры тензоров с помощью паддинга
+        for i in range(len(model_batch_data["logits"])):
+            current_length = model_batch_data["logits"][i].shape[0]
+            if current_length < max_seq_length:
+                # Паддинг для логитов модели
+                padding_size = max_seq_length - current_length
+                padding = torch.zeros(padding_size, model_batch_data["logits"][i].shape[1], 
+                                     device=model_batch_data["logits"][i].device)
+                model_batch_data["logits"][i] = torch.cat([model_batch_data["logits"][i], padding], dim=0)
+                
+                # Паддинг для последовательностей
+                seq_padding = torch.zeros(padding_size, device=model_batch_data["sequences"][i].device, 
+                                        dtype=model_batch_data["sequences"][i].dtype)
+                model_batch_data["sequences"][i] = torch.cat([model_batch_data["sequences"][i], seq_padding], dim=0)
+                
+                # Паддинг для масок действий
+                mask_padding = torch.zeros(padding_size, device=model_batch_data["action_masks"][i].device, 
+                                         dtype=model_batch_data["action_masks"][i].dtype)
+                model_batch_data["action_masks"][i] = torch.cat([model_batch_data["action_masks"][i], mask_padding], dim=0)
+                
+                # Паддинг для логитов референсной модели
+                ref_padding = torch.zeros(padding_size, ref_batch_data["logits"][i].shape[1], 
+                                        device=ref_batch_data["logits"][i].device)
+                ref_batch_data["logits"][i] = torch.cat([ref_batch_data["logits"][i], ref_padding], dim=0)
+        
+        # Теперь стекируем выровненные тензоры
         model_batch_data["logits"] = torch.stack(model_batch_data["logits"])
         model_batch_data["sequences"] = torch.stack(model_batch_data["sequences"])
         model_batch_data["action_masks"] = torch.stack(model_batch_data["action_masks"])
@@ -1501,23 +1125,6 @@ def main():
     
     print(f"{COLOR_GREEN}Обучение завершено после {global_step} шагов.{COLOR_RESET}")
     logger.close()
-
-def format_short_state(state):
-    """
-    Форматирует состояние скважины в компактном виде для истории взаимодействий.
-    
-    Args:
-        state: Текущее состояние симулятора
-    
-    Returns:
-        str: Короткое описание состояния
-    """
-    if len(state) >= 4:
-        # Базовое состояние [pressure, flow_rate, production, time]
-        return f"P={state[0]:.1f}атм, Q={state[1]:.1f}м³/сут, V={state[2]:.1f}м³, t={state[3]:.1f}д"
-    else:
-        # Если формат состояния неизвестен, возвращаем просто числа
-        return ", ".join([f"{x:.1f}" for x in state])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import numpy as np
+import random
 
 class SingleWellSimulator:
     """
@@ -55,6 +56,100 @@ class SingleWellSimulator:
             self.cumulative_production,
             self.time
         ])
+        return self.state
+        
+    def reset_to_random_state(self, min_depletion: float = 0.0, max_depletion: float = 0.9, 
+                              use_realistic_ranges: bool = True) -> np.ndarray:
+        """
+        Сбрасывает симулятор к случайному промежуточному состоянию разработки скважины.
+        
+        Args:
+            min_depletion (float): Минимальное значение степени истощения (0.0 = начало разработки)
+            max_depletion (float): Максимальное значение степени истощения (1.0 = полное истощение)
+            use_realistic_ranges (bool): Использовать ли реалистичные ограничения для параметров
+            
+        Returns:
+            np.ndarray: Случайное промежуточное состояние
+        """
+        # Сначала сбрасываем в начальное состояние, чтобы корректно проинициализировать все переменные
+        self.reset()
+        
+        # Ограничиваем максимальную степень истощения для реалистичности
+        if use_realistic_ranges:
+            # Обычно скважина не добывается до полного истощения из-за экономических ограничений
+            realistic_max_depletion = min(max_depletion, 0.85)  # Не более 85% от общего объема
+            # В начале разработки обычно уже есть минимальный отбор для тестирования
+            realistic_min_depletion = max(min_depletion, 0.01)  # Минимум 1% от общего объема
+            
+            # Используем ограниченные диапазоны
+            min_depletion = realistic_min_depletion
+            max_depletion = realistic_max_depletion
+        
+        # Выбираем случайную степень истощения из заданного интервала
+        depletion_ratio = random.uniform(min_depletion, max_depletion)
+        
+        # Рассчитываем накопленную добычу на основе выбранной степени истощения
+        self.cumulative_production = depletion_ratio * self.total_volume
+        
+        # Рассчитываем пластовое давление на основе степени истощения
+        # Добавляем небольшую нелинейность для реалистичности
+        if use_realistic_ranges:
+            # В реальности давление падает нелинейно, обычно быстрее в начале разработки
+            pressure_factor = 1.0 - depletion_ratio**0.8  # Нелинейная зависимость
+            # Добавляем небольшую случайность для учета непредсказуемых факторов
+            pressure_variation = random.uniform(-0.05, 0.05)  # ±5% вариации
+            self.reservoir_pressure = self.initial_reservoir_pressure * max(0, min(1, pressure_factor + pressure_variation))
+        else:
+            # Линейное падение давления (упрощенная модель)
+            self.reservoir_pressure = self.initial_reservoir_pressure * (1.0 - depletion_ratio)
+        
+        # Рассчитываем случайное значение открытия штуцера для последнего действия
+        if use_realistic_ranges:
+            # В зависимости от степени истощения мы можем ограничить диапазон открытия штуцера
+            if depletion_ratio < 0.3:
+                # В начале разработки обычно применяют большее открытие
+                last_action_value = random.uniform(0.6, 1.0)
+            elif depletion_ratio < 0.7:
+                # В середине разработки используют средние значения
+                last_action_value = random.uniform(0.3, 0.8)
+            else:
+                # При высоком истощении обычно снижают открытие для поддержания давления
+                last_action_value = random.uniform(0.1, 0.5)
+        else:
+            # Полностью случайное открытие штуцера
+            last_action_value = random.uniform(0.0, 1.0)
+        
+        self.last_action = last_action_value
+        self.current_valve_opening = last_action_value
+        
+        # Рассчитываем текущий дебит с учетом текущего давления и последнего действия
+        delta_p = max(0.0, self.reservoir_pressure - self.bhp)
+        self.flow_rate = self.pi * delta_p * last_action_value
+        self.current_rate = self.flow_rate
+        
+        # Рассчитываем пройденное время, пропорциональное истощению
+        if use_realistic_ranges:
+            # В реальности время добычи будет иметь нелинейную зависимость от степени истощения
+            # При этом учитываем характер пласта и режим разработки
+            base_time = self.max_time * (depletion_ratio**0.9)  # Нелинейная зависимость
+            
+            # Добавляем реалистичную вариацию времени
+            time_variation = 0.15 * base_time  # 15% вариации
+            self.time = min(self.max_time - self.dt, max(0, base_time + random.uniform(-time_variation, time_variation)))
+        else:
+            # Простая линейная зависимость с небольшой случайностью
+            proportional_time = depletion_ratio * self.max_time
+            time_variation = 0.2 * proportional_time  # 20% вариации
+            self.time = min(self.max_time - self.dt, max(0, proportional_time + random.uniform(-time_variation, time_variation)))
+        
+        # Обновляем вектор состояния
+        self.state = np.array([
+            self.reservoir_pressure,
+            self.flow_rate,
+            self.cumulative_production,
+            self.time
+        ])
+        
         return self.state
 
     def step(self, action: float) -> tuple[np.ndarray, float, bool, dict]:
